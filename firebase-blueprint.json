@@ -1,0 +1,418 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Cloud-persisted Lyrihost operator profile, wallet mirror, and platform preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 5,
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "admin"]
+        },
+        "coinBalance": {
+          "type": "integer"
+        },
+        "unlimitedCoins": {
+          "type": "boolean"
+        },
+        "maxDeployments": {
+          "type": "integer"
+        },
+        "referralCode": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "acceptedTerms": {
+          "type": "boolean"
+        },
+        "defaultRegion": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "defaultRestartPolicy": {
+          "type": "string",
+          "enum": ["always", "on-failure", "never"]
+        },
+        "defaultRuntime": {
+          "type": "string",
+          "enum": ["node-20", "node-22", "python-3.12", "docker", "bun-1"]
+        },
+        "promoEmailsOptIn": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "role",
+        "coinBalance",
+        "unlimitedCoins",
+        "maxDeployments",
+        "referralCode",
+        "acceptedTerms",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BotDeploymentRecord": {
+      "title": "BotDeploymentRecord",
+      "description": "Cloud-persisted bot deployment specification owned by a verified operator.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 5,
+          "maxLength": 200
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "repoUrl": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500
+        },
+        "repoFullName": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["discord", "telegram", "whatsapp", "slack", "custom"]
+        },
+        "framework": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "status": {
+          "type": "string",
+          "enum": ["online", "building", "scanning", "stopped", "failed"]
+        },
+        "planId": {
+          "type": "string",
+          "enum": ["plan_15d", "plan_30d", "plan_unlimited"]
+        },
+        "memoryLimitMb": {
+          "type": "integer"
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "region": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "runtime": {
+          "type": "string",
+          "enum": ["node-20", "node-22", "python-3.12", "docker", "bun-1"]
+        },
+        "installCommand": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "buildCommand": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "startCommand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "restartPolicy": {
+          "type": "string",
+          "enum": ["always", "on-failure", "never"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "ownerEmail",
+        "name",
+        "repoUrl",
+        "repoFullName",
+        "platform",
+        "framework",
+        "status",
+        "planId",
+        "memoryLimitMb",
+        "branch",
+        "region",
+        "runtime",
+        "startCommand",
+        "restartPolicy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BotTemplateRecord": {
+      "title": "BotTemplateRecord",
+      "description": "Verified bot template published by the Lyrihost admin.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "repoFullName": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "repoUrl": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500
+        },
+        "description": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 1000
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["discord", "telegram", "whatsapp", "slack", "custom"]
+        },
+        "framework": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "runtime": {
+          "type": "string",
+          "enum": ["node-20", "node-22", "python-3.12", "docker", "bun-1"]
+        },
+        "defaultBranch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "installCommand": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "buildCommand": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "startCommand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "sessionPairUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "imageUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdByUid": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "repoFullName",
+        "repoUrl",
+        "description",
+        "platform",
+        "framework",
+        "runtime",
+        "defaultBranch",
+        "startCommand",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SupportTicketRecord": {
+      "title": "SupportTicketRecord",
+      "description": "User complaint or support ticket stored persistently in Firestore.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 5,
+          "maxLength": 200
+        },
+        "category": {
+          "type": "string",
+          "enum": ["complaint", "billing", "bug", "feature", "other"]
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["normal", "high", "urgent"]
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "message": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 4000
+        },
+        "status": {
+          "type": "string",
+          "enum": ["open", "in_review", "resolved"]
+        },
+        "adminReply": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "userEmail",
+        "category",
+        "priority",
+        "subject",
+        "message",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRoleRecord": {
+      "title": "AdminRoleRecord",
+      "description": "Trusted administrator marker document.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 5,
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private operator profile, quota, wallet mirror, and platform settings (PII restricted to owner and admin)."
+    },
+    "/deployments/{deploymentId}": {
+      "schema": { "$ref": "#/entities/BotDeploymentRecord" },
+      "description": "Bot deployment configurations scoped strictly to their ownerUid or admin."
+    },
+    "/templates/{templateId}": {
+      "schema": { "$ref": "#/entities/BotTemplateRecord" },
+      "description": "Admin-managed custom bot templates readable by verified signed-in operators."
+    },
+    "/tickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/SupportTicketRecord" },
+      "description": "User complaints and admin support responses scoped to ownerUid and admin."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRoleRecord" },
+      "description": "Admin role directory strictly writable only by bootstrapped root admin."
+    }
+  }
+}

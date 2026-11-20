@@ -1,0 +1,479 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Catch-All Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 2 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isRootAdminEmail() {
+      return isSignedIn() && request.auth.token.email == 'sharksam004@gmail.com';
+    }
+
+    function isAdmin() {
+      return isRootAdminEmail() ||
+        (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isNonEmptyString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+          'uid',
+          'email',
+          'role',
+          'coinBalance',
+          'unlimitedCoins',
+          'maxDeployments',
+          'referralCode',
+          'acceptedTerms',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'email',
+          'role',
+          'coinBalance',
+          'unlimitedCoins',
+          'maxDeployments',
+          'referralCode',
+          'acceptedTerms',
+          'defaultRegion',
+          'defaultRestartPolicy',
+          'defaultRuntime',
+          'promoEmailsOptIn',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.uid == userId &&
+        isNonEmptyString(data.uid, 4, 128) &&
+        data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        isNonEmptyString(data.email, 5, 200) &&
+        data.role in ['user', 'admin'] &&
+        data.coinBalance is int &&
+        data.coinBalance >= 0 &&
+        data.unlimitedCoins is bool &&
+        data.maxDeployments is int &&
+        data.maxDeployments >= 0 &&
+        data.maxDeployments <= 10000 &&
+        isNonEmptyString(data.referralCode, 3, 32) &&
+        data.referralCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.acceptedTerms is bool &&
+        data.acceptedTerms == true &&
+        (!('defaultRegion' in data) || isNonEmptyString(data.defaultRegion, 2, 32)) &&
+        (!('defaultRestartPolicy' in data) || data.defaultRestartPolicy in ['always', 'on-failure', 'never']) &&
+        (!('defaultRuntime' in data) || data.defaultRuntime in ['node-20', 'node-22', 'python-3.12', 'docker', 'bun-1']) &&
+        (!('promoEmailsOptIn' in data) || data.promoEmailsOptIn is bool) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidDeploymentRecord(data, depId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'ownerEmail',
+          'name',
+          'repoUrl',
+          'repoFullName',
+          'platform',
+          'framework',
+          'status',
+          'planId',
+          'memoryLimitMb',
+          'branch',
+          'region',
+          'runtime',
+          'startCommand',
+          'restartPolicy',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'ownerEmail',
+          'name',
+          'repoUrl',
+          'repoFullName',
+          'platform',
+          'framework',
+          'status',
+          'planId',
+          'memoryLimitMb',
+          'branch',
+          'region',
+          'runtime',
+          'installCommand',
+          'buildCommand',
+          'startCommand',
+          'restartPolicy',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.id == depId &&
+        isValidId(data.id) &&
+        isValidId(data.ownerUid) &&
+        isNonEmptyString(data.ownerEmail, 5, 200) &&
+        isNonEmptyString(data.name, 1, 120) &&
+        isNonEmptyString(data.repoUrl, 10, 500) &&
+        isNonEmptyString(data.repoFullName, 3, 200) &&
+        data.platform in ['discord', 'telegram', 'whatsapp', 'slack', 'custom'] &&
+        isNonEmptyString(data.framework, 1, 80) &&
+        data.status in ['online', 'building', 'scanning', 'stopped', 'failed'] &&
+        data.planId in ['plan_15d', 'plan_30d', 'plan_unlimited'] &&
+        data.memoryLimitMb is int &&
+        data.memoryLimitMb >= 256 &&
+        data.memoryLimitMb <= 4096 &&
+        isNonEmptyString(data.branch, 1, 100) &&
+        isNonEmptyString(data.region, 2, 32) &&
+        data.runtime in ['node-20', 'node-22', 'python-3.12', 'docker', 'bun-1'] &&
+        (!('installCommand' in data) || (data.installCommand is string && data.installCommand.size() <= 300)) &&
+        (!('buildCommand' in data) || (data.buildCommand is string && data.buildCommand.size() <= 300)) &&
+        isNonEmptyString(data.startCommand, 1, 300) &&
+        data.restartPolicy in ['always', 'on-failure', 'never'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidBotTemplate(data, tplId) {
+      return data.keys().hasAll([
+          'id',
+          'name',
+          'repoFullName',
+          'repoUrl',
+          'description',
+          'platform',
+          'framework',
+          'runtime',
+          'defaultBranch',
+          'startCommand',
+          'createdByUid',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'name',
+          'repoFullName',
+          'repoUrl',
+          'description',
+          'platform',
+          'framework',
+          'runtime',
+          'defaultBranch',
+          'installCommand',
+          'buildCommand',
+          'startCommand',
+          'sessionPairUrl',
+          'imageUrl',
+          'createdByUid',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.id == tplId &&
+        isValidId(data.id) &&
+        isNonEmptyString(data.name, 1, 120) &&
+        isNonEmptyString(data.repoFullName, 3, 200) &&
+        isNonEmptyString(data.repoUrl, 10, 500) &&
+        isNonEmptyString(data.description, 3, 1000) &&
+        data.platform in ['discord', 'telegram', 'whatsapp', 'slack', 'custom'] &&
+        isNonEmptyString(data.framework, 1, 80) &&
+        data.runtime in ['node-20', 'node-22', 'python-3.12', 'docker', 'bun-1'] &&
+        isNonEmptyString(data.defaultBranch, 1, 100) &&
+        (!('installCommand' in data) || (data.installCommand is string && data.installCommand.size() <= 300)) &&
+        (!('buildCommand' in data) || (data.buildCommand is string && data.buildCommand.size() <= 300)) &&
+        isNonEmptyString(data.startCommand, 1, 300) &&
+        (!('sessionPairUrl' in data) || (data.sessionPairUrl is string && data.sessionPairUrl.size() <= 500)) &&
+        (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 500)) &&
+        isValidId(data.createdByUid) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSupportTicket(data, ticketId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'userEmail',
+          'category',
+          'priority',
+          'subject',
+          'message',
+          'status',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'userEmail',
+          'category',
+          'priority',
+          'subject',
+          'message',
+          'status',
+          'adminReply',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.id == ticketId &&
+        isValidId(data.id) &&
+        isValidId(data.ownerUid) &&
+        isNonEmptyString(data.userEmail, 5, 200) &&
+        data.category in ['complaint', 'billing', 'bug', 'feature', 'other'] &&
+        data.priority in ['normal', 'high', 'urgent'] &&
+        isNonEmptyString(data.subject, 2, 200) &&
+        isNonEmptyString(data.message, 3, 4000) &&
+        data.status in ['open', 'in_review', 'resolved'] &&
+        (!('adminReply' in data) || (data.adminReply is string && data.adminReply.size() <= 4000)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRole(data, adminUid) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        data.uid == adminUid &&
+        isValidId(data.uid) &&
+        isNonEmptyString(data.email, 5, 200) &&
+        data.createdAt is timestamp;
+    }
+
+    // 4. Collection Rules
+    // Connection test doc check (read-only ping)
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // Users collection (PII strict owner/admin only; self-registration cannot grant coins or admin role)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isRootAdminEmail());
+
+      allow create: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == request.auth.uid &&
+        incoming().email == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (isRootAdminEmail() && incoming().role == 'admin') ||
+          (
+            incoming().role == 'user' &&
+            incoming().coinBalance == 0 &&
+            incoming().unlimitedCoins == false &&
+            incoming().maxDeployments == 5
+          )
+        );
+
+      allow update: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().referralCode == existing().referralCode &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner(userId) &&
+            incoming().role == existing().role &&
+            incoming().coinBalance == existing().coinBalance &&
+            incoming().unlimitedCoins == existing().unlimitedCoins &&
+            incoming().maxDeployments == existing().maxDeployments &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'defaultRegion',
+              'defaultRestartPolicy',
+              'defaultRuntime',
+              'promoEmailsOptIn',
+              'updatedAt'
+            ])
+          ) ||
+          (isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'coinBalance',
+              'unlimitedCoins',
+              'maxDeployments',
+              'role',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    // Deployments collection (strict ownerUid isolation; no cross-user scraping)
+    match /deployments/{deploymentId} {
+      allow get: if isValidId(deploymentId) && (isOwner(existing().ownerUid) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isRootAdminEmail());
+
+      allow create: if isSignedIn() &&
+        isValidId(deploymentId) &&
+        isValidDeploymentRecord(incoming(), deploymentId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        isValidId(deploymentId) &&
+        isValidDeploymentRecord(incoming(), deploymentId) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().ownerEmail == existing().ownerEmail &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner(existing().ownerUid) &&
+            incoming().planId == existing().planId &&
+            incoming().memoryLimitMb == existing().memoryLimitMb &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name',
+              'branch',
+              'region',
+              'runtime',
+              'installCommand',
+              'buildCommand',
+              'startCommand',
+              'restartPolicy',
+              'status',
+              'updatedAt'
+            ])
+          ) ||
+          (isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'planId',
+              'memoryLimitMb',
+              'restartPolicy',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(deploymentId) && (isOwner(existing().ownerUid) || isAdmin());
+    }
+
+    // Custom Bot Templates (Admin-authored, readable by verified signed-in operators)
+    match /templates/{templateId} {
+      allow get: if isValidId(templateId) && isSignedIn();
+      allow list: if isSignedIn();
+
+      allow create: if isAdmin() &&
+        isValidId(templateId) &&
+        isValidBotTemplate(incoming(), templateId) &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isAdmin() &&
+        isValidId(templateId) &&
+        isValidBotTemplate(incoming(), templateId) &&
+        incoming().id == existing().id &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name',
+          'repoFullName',
+          'repoUrl',
+          'description',
+          'platform',
+          'framework',
+          'runtime',
+          'defaultBranch',
+          'installCommand',
+          'buildCommand',
+          'startCommand',
+          'sessionPairUrl',
+          'imageUrl',
+          'updatedAt'
+        ]);
+
+      allow delete: if isValidId(templateId) && isAdmin();
+    }
+
+    // Support & Complaints Tickets (Owner creates & views; Admin replies/resolves; resolved locked for non-admins)
+    match /tickets/{ticketId} {
+      allow get: if isValidId(ticketId) && (isOwner(existing().ownerUid) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isRootAdminEmail());
+
+      allow create: if isSignedIn() &&
+        isValidId(ticketId) &&
+        isValidSupportTicket(incoming(), ticketId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().userEmail == request.auth.token.email &&
+        incoming().status == 'open' &&
+        !('adminReply' in incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        isValidId(ticketId) &&
+        isValidSupportTicket(incoming(), ticketId) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().userEmail == existing().userEmail &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner(existing().ownerUid) &&
+            existing().status != 'resolved' &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'subject',
+              'message',
+              'priority',
+              'updatedAt'
+            ])
+          ) ||
+          (isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'adminReply',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(ticketId) && isAdmin();
+    }
+
+    // Admin directory (Strictly root admin writable)
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow create: if isRootAdminEmail() &&
+        isValidId(userId) &&
+        isValidAdminRole(incoming(), userId) &&
+        incoming().createdAt == request.time;
+      allow update, delete: if isRootAdminEmail() && isValidId(userId);
+    }
+  }
+}

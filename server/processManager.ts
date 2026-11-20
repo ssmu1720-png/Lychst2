@@ -1,0 +1,431 @@
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const BOTS_DIR = process.env.BOTS_DIR || path.join(process.cwd(), 'bot_instances');
+
+export interface BotProcess {
+  pid: number;
+  botId: string;
+  numericId?: number;
+  startedAt: number;
+  command: string;
+  process: ChildProcess;
+  logs: string[];
+}
+
+export const processEmitter = new EventEmitter();
+processEmitter.setMaxListeners(100);
+
+const runningProcesses = new Map<string, BotProcess>();
+const restartingIds = new Set<string>();
+const intentionallyStopped = new Set<string>();
+const crashTimestamps = new Map<string, number[]>();
+const MAX_LOG_LINES = 500;
+
+type DbRestartCallback = (botId: string, pid: number) => Promise<void> | void;
+type ProcessExitCallback = (botId: string, code: number | null) => Promise<void> | void;
+
+let _dbRestartCallback: DbRestartCallback | null = null;
+let _processExitCallback: ProcessExitCallback | null = null;
+
+export function setDbRestartCallback(cb: DbRestartCallback): void {
+  _dbRestartCallback = cb;
+}
+
+export function setProcessExitCallback(cb: ProcessExitCallback): void {
+  _processExitCallback = cb;
+}
+
+export function getBotsRootDir(): string {
+  return BOTS_DIR;
+}
+
+export function getBotDir(botKey: string | number): string {
+  const safeKey = String(botKey).replace(/[^A-Za-z0-9_-]/g, '');
+  return path.join(BOTS_DIR, `bot_${safeKey}`);
+}
+
+export function ensureBotsDir(): void {
+  if (!fs.existsSync(BOTS_DIR)) {
+    fs.mkdirSync(BOTS_DIR, { recursive: true });
+  }
+}
+
+export function getProcess(botId: string): BotProcess | undefined {
+  return runningProcesses.get(botId);
+}
+
+export function isAutoRestarting(botId: string): boolean {
+  return restartingIds.has(botId);
+}
+
+export function isRunning(botId: string, fallbackPid?: number | null): boolean {
+  const bp = runningProcesses.get(botId);
+  if (bp && bp.pid > 0) {
+    try {
+      process.kill(bp.pid, 0);
+      return true;
+    } catch {
+      runningProcesses.delete(botId);
+      return false;
+    }
+  }
+  if (fallbackPid && fallbackPid > 0) {
+    try {
+      process.kill(fallbackPid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export function getLogs(botId: string): string {
+  const bp = runningProcesses.get(botId);
+  if (!bp) return '';
+  return bp.logs.join('');
+}
+
+export function stripAnsi(str: string): string {
+  return str.replace(/\x1B(?:\[[0-9;]*[mGKHFJ]|\][^\x07]*\x07|[()][A-Z0-9])/g, '');
+}
+
+export interface StartProcessOptions {
+  dirKey?: string | number;
+  numericId?: number;
+  autoRestart?: boolean;
+  env?: Record<string, string>;
+}
+
+function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  if (pid <= 0) return;
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fallback to direct PID if group kill fails
+    }
+  }
+  process.kill(pid, signal);
+}
+
+export function killProcessesInDirectory(targetDir: string): void {
+  const resolvedTarget = path.resolve(targetDir);
+
+  for (const [id, bp] of runningProcesses.entries()) {
+    const bpDir = path.resolve(getBotDir(id));
+    if (bpDir === resolvedTarget || bpDir.startsWith(resolvedTarget + path.sep)) {
+      stopProcess(id);
+      if (bp.pid > 0) {
+        try {
+          killProcessGroup(bp.pid, 'SIGKILL');
+        } catch {
+          // already exited
+        }
+      }
+    }
+  }
+
+  if (process.platform !== 'linux' || !fs.existsSync('/proc')) return;
+
+  try {
+    const entries = fs.readdirSync('/proc');
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (pid <= 1 || pid === process.pid) continue;
+      try {
+        const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+        if (cwd === resolvedTarget || cwd.startsWith(resolvedTarget + path.sep)) {
+          process.kill(pid, 'SIGKILL');
+        }
+      } catch {
+        // ignore unreadable proc entries or exited processes
+      }
+    }
+  } catch {
+    // ignore /proc scan failure
+  }
+}
+
+export function killAllOrphanedBotProcesses(): void {
+  if (!fs.existsSync(BOTS_DIR)) return;
+  const rootDir = path.resolve(BOTS_DIR);
+  const activePids = new Set<number>(Array.from(runningProcesses.values()).map((bp) => bp.pid));
+
+  if (process.platform !== 'linux' || !fs.existsSync('/proc')) return;
+
+  try {
+    const entries = fs.readdirSync('/proc');
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (pid <= 1 || pid === process.pid || activePids.has(pid)) continue;
+      try {
+        const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+        if (cwd === rootDir || cwd.startsWith(rootDir + path.sep)) {
+          process.kill(pid, 'SIGKILL');
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function safeRemoveDir(targetDir: string): void {
+  if (!fs.existsSync(targetDir)) return;
+  killProcessesInDirectory(targetDir);
+  try {
+    fs.rmSync(targetDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
+  } catch {
+    // Second pass after killing any lingering descriptors
+    killProcessesInDirectory(targetDir);
+    fs.rmSync(targetDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+}
+
+export function startProcess(
+  botId: string,
+  command: string,
+  options: StartProcessOptions = {}
+): BotProcess {
+  const dirKey = options.dirKey ?? botId;
+  const botDir = getBotDir(dirKey);
+  if (!fs.existsSync(botDir)) {
+    throw new Error(`Bot directory not found: ${botDir}`);
+  }
+
+  const trimmedCmd = command.trim();
+  if (!trimmedCmd) {
+    throw new Error('Start command is empty.');
+  }
+
+  intentionallyStopped.delete(botId);
+  restartingIds.delete(botId);
+
+  const hookPath = path.resolve(process.cwd(), 'server', 'lyrihostBotHook.cjs');
+  const nodeOptions = fs.existsSync(hookPath)
+    ? `--require ${JSON.stringify(hookPath)} --max-old-space-size=2048`
+    : '--max-old-space-size=2048';
+
+  const parentEnv: NodeJS.ProcessEnv = { ...process.env };
+  delete parentEnv.PORT;
+
+  const child = spawn(trimmedCmd, {
+    cwd: botDir,
+    env: {
+      ...parentEnv,
+      PORT: String(10000 + (options.numericId || 1)),
+      ...(options.env || {}),
+      NODE_ENV: 'production',
+      TERM: 'xterm-256color',
+      FORCE_COLOR: '1',
+      NODE_OPTIONS: nodeOptions,
+      NODE_NO_WARNINGS: '1',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    shell: true,
+    detached: process.platform !== 'win32',
+  });
+
+  const bp: BotProcess = {
+    pid: child.pid ?? 0,
+    botId,
+    numericId: options.numericId,
+    startedAt: Date.now(),
+    command: trimmedCmd,
+    process: child,
+    logs: [],
+  };
+
+  runningProcesses.set(botId, bp);
+
+  const emitOutput = (data: Buffer) => {
+    const text = stripAnsi(data.toString());
+    bp.logs.push(text);
+    if (bp.logs.length > MAX_LOG_LINES) {
+      bp.logs = bp.logs.slice(-MAX_LOG_LINES);
+    }
+    processEmitter.emit('output', { botId, chunk: text });
+    processEmitter.emit(`output:${botId}`, text);
+    if (options.numericId !== undefined) {
+      processEmitter.emit(`output:${options.numericId}`, text);
+    }
+  };
+
+  child.stdout?.on('data', emitOutput);
+  child.stderr?.on('data', emitOutput);
+
+  child.on('exit', (code) => {
+    const wasManualStop = intentionallyStopped.has(botId);
+    intentionallyStopped.delete(botId);
+    runningProcesses.delete(botId);
+
+    processEmitter.emit(`exit:${botId}`, code);
+    if (options.numericId !== undefined) {
+      processEmitter.emit(`exit:${options.numericId}`, code);
+    }
+
+    if (wasManualStop) {
+      crashTimestamps.delete(botId);
+      return;
+    }
+
+    if (options.autoRestart && code !== 0 && code !== null) {
+      const now = Date.now();
+      const history = (crashTimestamps.get(botId) ?? []).filter((t) => now - t < 25000);
+      history.push(now);
+      crashTimestamps.set(botId, history);
+
+      if (history.length >= 4) {
+        crashTimestamps.delete(botId);
+        emitOutput(
+          Buffer.from(
+            '\r\n[RUNTIME] Crash loop detected (4 rapid exits in 25s). Auto-restart paused; inspect logs above.\r\n'
+          )
+        );
+        if (_processExitCallback) {
+          void _processExitCallback(botId, code);
+        }
+        return;
+      }
+
+      restartingIds.add(botId);
+      setTimeout(async () => {
+        restartingIds.delete(botId);
+        if (runningProcesses.has(botId) || intentionallyStopped.has(botId)) return;
+        try {
+          const restarted = startProcess(botId, trimmedCmd, options);
+          if (_dbRestartCallback && restarted.pid) {
+            await _dbRestartCallback(botId, restarted.pid);
+          }
+        } catch (err) {
+          console.error(`[processManager] Auto-restart failed for ${botId}:`, err);
+          if (_processExitCallback) {
+            void _processExitCallback(botId, code);
+          }
+        }
+      }, 3000);
+      return;
+    }
+
+    if (_processExitCallback) {
+      void _processExitCallback(botId, code);
+    }
+  });
+
+  child.on('error', (err) => {
+    intentionallyStopped.delete(botId);
+    restartingIds.delete(botId);
+    emitOutput(Buffer.from(`\r\n[ERROR] ${err.message}\r\n`));
+    runningProcesses.delete(botId);
+    processEmitter.emit(`exit:${botId}`, 1);
+    if (options.numericId !== undefined) {
+      processEmitter.emit(`exit:${options.numericId}`, 1);
+    }
+    if (_processExitCallback) {
+      void _processExitCallback(botId, 1);
+    }
+  });
+
+  return bp;
+}
+
+export function stopProcess(botId: string): boolean {
+  intentionallyStopped.add(botId);
+  restartingIds.delete(botId);
+
+  const bp = runningProcesses.get(botId);
+  if (!bp) return false;
+
+  const targetPid = bp.pid;
+  runningProcesses.delete(botId);
+
+  try {
+    killProcessGroup(targetPid, 'SIGTERM');
+    setTimeout(() => {
+      try {
+        process.kill(targetPid, 0);
+        killProcessGroup(targetPid, 'SIGKILL');
+      } catch {
+        // already exited
+      }
+    }, 4000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function sendInput(botId: string, text: string): boolean {
+  const bp = runningProcesses.get(botId);
+  if (!bp || !bp.process.stdin) return false;
+  try {
+    bp.process.stdin.write(text + '\n');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function sendRawInput(botId: string, rawData: string): boolean {
+  const bp = runningProcesses.get(botId);
+  if (!bp || !bp.process.stdin) return false;
+  try {
+    bp.process.stdin.write(rawData);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function sampleProcessStats(pid: number): Promise<{ cpuPercent: number; memoryMb: number } | null> {
+  return new Promise((resolve) => {
+    if (!pid || pid <= 0) {
+      resolve(null);
+      return;
+    }
+    const args =
+      process.platform === 'linux'
+        ? ['--no-headers', '-o', '%cpu=,rss=', '-g', String(pid)]
+        : ['-p', String(pid), '-o', '%cpu=,rss='];
+
+    execFile('ps', args, { timeout: 1000 }, (err, stdout) => {
+      if (err || !stdout.trim()) {
+        // Fallback to single PID query if process group query returns empty
+        execFile('ps', ['-p', String(pid), '-o', '%cpu=,rss='], { timeout: 1000 }, (err2, out2) => {
+          if (err2 || !out2.trim()) {
+            resolve(null);
+            return;
+          }
+          resolve(parsePsOutput(out2));
+        });
+        return;
+      }
+      resolve(parsePsOutput(stdout));
+    });
+  });
+}
+
+function parsePsOutput(output: string): { cpuPercent: number; memoryMb: number } {
+  let totalCpu = 0;
+  let totalRssKb = 0;
+  for (const rawLine of output.trim().split(/\r?\n/)) {
+    const parts = rawLine.trim().split(/\s+/);
+    const cpu = Number.parseFloat(parts[0] || '0');
+    const rss = Number.parseInt(parts[1] || '0', 10);
+    if (Number.isFinite(cpu)) totalCpu += cpu;
+    if (Number.isFinite(rss)) totalRssKb += rss;
+  }
+  return {
+    cpuPercent: Number(totalCpu.toFixed(1)),
+    memoryMb: Math.round(totalRssKb / 1024),
+  };
+}
