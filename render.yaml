@@ -1,11 +1,10 @@
 services:
   - type: web
-    name: lh
+    name: lyri
     runtime: docker
-    dockerfilePath: ./Dockerfile
     plan: free
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
-    autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
