@@ -32,6 +32,7 @@ import {
   cloneRepository,
   getRepoHeadInfo,
   pullRepository,
+  resolveDeploymentCommands,
   runShellStep,
   writeDotEnvFile,
 } from './server/gitRunner.ts';
@@ -51,6 +52,7 @@ import {
   setProcessExitCallback,
   startProcess,
   stopProcess,
+  waitForProcessStability,
 } from './server/processManager.ts';
 import { TEMPLATE_BOTS } from './src/catalog/templateBots.ts';
 import {
@@ -978,8 +980,17 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       `Injected ${Object.keys(envMap).length} environment variable(s) into ${dep.id} runtime.`
     );
 
-    // Step 3: Real install step with live log streaming + native build script fallback
-    const installCmd = dep.settings.installCommand.trim();
+    const resolved = resolveDeploymentCommands(botDir, dep.settings);
+    for (const note of resolved.notes) {
+      appendLog(dep, 'info', 'config', note);
+    }
+    dep.settings.runtime = resolved.runtime;
+    dep.settings.installCommand = resolved.installCommand;
+    dep.settings.buildCommand = resolved.buildCommand;
+    dep.settings.startCommand = resolved.startCommand;
+
+    // Step 3: Real install step with live log streaming + automatic package manager & native script fallback
+    const installCmd = resolved.installCommand.trim();
     if (installCmd) {
       appendLog(dep, 'info', 'install', `Executing: ${installCmd}`);
       let installRes = await runShellStep(
@@ -991,29 +1002,49 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
         controller.signal
       );
       if (isAborted()) return;
-      if (!installRes.ok && /\bnpm\s+(install|i|ci)\b/i.test(installCmd) && !installCmd.includes('--ignore-scripts')) {
-        const fallbackCmd = 'npm install --legacy-peer-deps --ignore-engines --ignore-scripts --no-audit --no-fund';
-        appendLog(dep, 'warn', 'install', `Primary install failed; retrying safely with: ${fallbackCmd}`);
-        installRes = await runShellStep(
-          fallbackCmd,
-          botDir,
-          envMap,
-          300000,
-          (line) => appendLog(dep, 'info', 'install', line),
-          controller.signal
-        );
-        if (isAborted()) return;
+
+      const looksLikeNodeInstall = /\b(npm|yarn|pnpm|bun)\b/i.test(installCmd);
+      if (!installRes.ok && looksLikeNodeInstall && fs.existsSync(path.join(botDir, 'package.json'))) {
+        if (!/npm\s+install.*--legacy-peer-deps/i.test(installCmd)) {
+          const npmCompatCmd = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
+          appendLog(dep, 'warn', 'install', `Primary install failed; retrying with compatibility flags: ${npmCompatCmd}`);
+          installRes = await runShellStep(
+            npmCompatCmd,
+            botDir,
+            envMap,
+            300000,
+            (line) => appendLog(dep, 'info', 'install', line),
+            controller.signal
+          );
+          if (isAborted()) return;
+        }
+
+        if (!installRes.ok && !installCmd.includes('--ignore-scripts')) {
+          const safeScriptsCmd =
+            'npm install --legacy-peer-deps --ignore-engines --ignore-scripts --no-audit --no-fund';
+          appendLog(dep, 'warn', 'install', `Retrying safely without native postinstall scripts: ${safeScriptsCmd}`);
+          installRes = await runShellStep(
+            safeScriptsCmd,
+            botDir,
+            envMap,
+            300000,
+            (line) => appendLog(dep, 'info', 'install', line),
+            controller.signal
+          );
+          if (isAborted()) return;
+        }
       }
+
       if (!installRes.ok) {
         dep.status = 'failed';
-        appendLog(dep, 'error', 'install', `Install step failed (${installCmd}): ${installRes.output.slice(-400)}`);
+        appendLog(dep, 'error', 'install', `Install step failed (${installCmd}): ${installRes.output.slice(-500)}`);
         return;
       }
       appendLog(dep, 'success', 'install', 'Dependencies installed cleanly.');
     }
 
     // Step 4: Real build step (if configured) with live log streaming
-    const buildCmd = dep.settings.buildCommand.trim();
+    const buildCmd = resolved.buildCommand.trim();
     if (buildCmd) {
       appendLog(dep, 'info', 'build', `Executing: ${buildCmd}`);
       const buildRes = await runShellStep(
@@ -1027,24 +1058,50 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       if (isAborted()) return;
       if (!buildRes.ok) {
         dep.status = 'failed';
-        appendLog(dep, 'error', 'build', `Build step failed (${buildCmd}): ${buildRes.output.slice(-400)}`);
+        appendLog(dep, 'error', 'build', `Build step failed (${buildCmd}): ${buildRes.output.slice(-500)}`);
         return;
       }
       appendLog(dep, 'success', 'build', 'Build completed cleanly.');
     }
 
-    // Step 5: Spawn real child process
-    const startCmd = dep.settings.startCommand.trim() || 'npm start';
+    // Step 5: Spawn real child process & verify startup stability
+    const startCmd = resolved.startCommand.trim() || 'npm start';
+    appendLog(dep, 'info', 'runtime', `Launching process: ${startCmd}`);
     const bp = startProcess(dep.id, startCmd, {
       numericId: dep.numericId,
-      autoRestart: dep.settings.restartPolicy !== 'never',
+      restartPolicy: dep.settings.restartPolicy,
+      memoryLimitMb: dep.memoryLimitMb,
       env: envMap,
     });
-    dep.status = 'online';
-    dep.pid = bp.pid;
-    dep.lastDeployedAt = nowIso();
-    dep.uptimeSeconds = 1;
-    appendLog(dep, 'success', 'runtime', `Bot process online (PID ${bp.pid}): ${startCmd}`);
+
+    const stability = await waitForProcessStability(dep.id, 1200);
+    if (isAborted()) return;
+
+    if (stability.alive) {
+      dep.status = 'online';
+      dep.pid = bp.pid;
+      dep.lastDeployedAt = nowIso();
+      dep.uptimeSeconds = 1;
+      appendLog(dep, 'success', 'runtime', `Bot process online (PID ${bp.pid}): ${startCmd}`);
+    } else if (isAutoRestarting(dep.id)) {
+      dep.status = 'building';
+      dep.pid = null;
+      appendLog(
+        dep,
+        'warn',
+        'runtime',
+        `Process exited immediately after launch (code ${stability.exitCode ?? 'null'}); attempting automatic restart...`
+      );
+    } else {
+      dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+      dep.pid = null;
+      appendLog(
+        dep,
+        dep.status === 'failed' ? 'error' : 'warn',
+        'runtime',
+        `Bot process exited right after startup with code ${stability.exitCode ?? 'null'}. Review console output above.`
+      );
+    }
   } catch (err) {
     if (!isAborted()) {
       dep.status = 'failed';
@@ -1067,6 +1124,24 @@ async function startupBotRestore(): Promise<void> {
     ensureBotsDir();
     killAllOrphanedBotProcesses();
     if (!state.deployments.length) return;
+
+    const resumeIds = new Set<string>();
+    for (const dep of state.deployments) {
+      const wasOnline = dep.status === 'online';
+      const notExpired = !dep.expiresAt || Date.parse(dep.expiresAt) > Date.now();
+      if (wasOnline && notExpired && dep.settings.restartPolicy !== 'never') {
+        resumeIds.add(dep.id);
+      }
+      if (dep.status === 'building' || dep.status === 'scanning' || (dep.status === 'online' && !isRunning(dep.id, dep.pid))) {
+        dep.status = 'stopped';
+        dep.pid = null;
+        dep.cpuPercent = 0;
+        dep.memoryMb = 0;
+        dep.uptimeSeconds = 0;
+      }
+    }
+    saveState();
+
     for (const dep of state.deployments) {
       const botDir = getBotDir(dep.id);
       if (!fs.existsSync(botDir)) {
@@ -1077,15 +1152,49 @@ async function startupBotRestore(): Promise<void> {
         });
         if (cloneRes.ok) {
           writeDotEnvFile(botDir, dep.settings.envVars);
-          const rawInstall = (dep.settings.installCommand || '').trim();
-          const installCmd =
-            rawInstall && !rawInstall.startsWith('echo ')
-              ? rawInstall
-              : 'npm install --legacy-peer-deps --ignore-engines --ignore-scripts';
-          await runShellStep(installCmd, botDir, buildEnvMap(dep.settings.envVars), 300000);
+          const resolved = resolveDeploymentCommands(botDir, dep.settings);
+          dep.settings.installCommand = resolved.installCommand;
+          dep.settings.buildCommand = resolved.buildCommand;
+          dep.settings.startCommand = resolved.startCommand;
+          dep.settings.runtime = resolved.runtime;
+          if (resolved.installCommand) {
+            await runShellStep(resolved.installCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
+          }
+          if (resolved.buildCommand) {
+            await runShellStep(resolved.buildCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
+          }
+        }
+      }
+
+      if (resumeIds.has(dep.id) && fs.existsSync(botDir)) {
+        try {
+          writeDotEnvFile(botDir, dep.settings.envVars);
+          const resolved = resolveDeploymentCommands(botDir, dep.settings);
+          const bp = startProcess(dep.id, resolved.startCommand, {
+            numericId: dep.numericId,
+            restartPolicy: dep.settings.restartPolicy,
+            memoryLimitMb: dep.memoryLimitMb,
+            env: buildEnvMap(dep.settings.envVars),
+          });
+          const stability = await waitForProcessStability(dep.id, 1000);
+          if (stability.alive) {
+            dep.status = 'online';
+            dep.pid = bp.pid;
+            dep.uptimeSeconds = 1;
+            pushDeploymentLog(dep, 'info', 'runtime', `Restored and started bot process after server boot (PID ${bp.pid}).`);
+          }
+        } catch (err) {
+          pushDeploymentLog(
+            dep,
+            'error',
+            'runtime',
+            `Auto-restore failed on boot: ${err instanceof Error ? err.message : 'Unknown error'}`
+          );
         }
       }
     }
+    saveState();
+    broadcastDeployments();
   } catch (err) {
     console.error('Startup bot restore error:', err);
   }
@@ -1465,6 +1574,10 @@ async function startServer() {
       res.status(404).json({ error: 'Deployment not found.' });
       return;
     }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to modify this deployment.' });
+      return;
+    }
     const { settings, redeploy } = req.body as { settings?: Partial<BotSettings>; redeploy?: boolean };
     if (!settings) {
       res.status(400).json({ error: 'Settings payload is required.' });
@@ -1502,8 +1615,12 @@ async function startServer() {
       res.status(404).json({ error: 'Deployment not found.' });
       return;
     }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to rescan this deployment.' });
+      return;
+    }
     try {
-      const scan = await performGitHubScan(dep.repoUrl, dep.settings.branch);
+      const scan = await performGitHubScan(dep.repoUrl, dep.settings.branch, dep.gitToken || undefined);
       dep.scanReport = scan;
       dep.commitSha = scan.latestCommitSha;
       dep.framework = scan.detectedFramework;
@@ -1528,6 +1645,10 @@ async function startServer() {
       res.status(404).json({ error: 'Deployment not found.' });
       return;
     }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to pull this deployment.' });
+      return;
+    }
     const botDir = getBotDir(dep.id);
     const token = dep.gitToken || state.githubToken || process.env.GITHUB_TOKEN || undefined;
     const pullRes = await pullRepository(botDir, token);
@@ -1542,12 +1663,17 @@ async function startServer() {
       res.status(404).json({ error: 'Deployment not found.' });
       return;
     }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to install dependencies for this deployment.' });
+      return;
+    }
     const botDir = getBotDir(dep.id);
     if (!fs.existsSync(botDir)) {
       res.status(400).json({ error: 'Bot directory not found.' });
       return;
     }
-    const installCmd = dep.settings.installCommand.trim() || 'npm install --legacy-peer-deps';
+    const resolved = resolveDeploymentCommands(botDir, dep.settings);
+    const installCmd = resolved.installCommand || 'npm install --legacy-peer-deps --ignore-engines';
     appendLog(dep, 'info', 'install', `Executing: ${installCmd}`);
     const result = await runShellStep(
       installCmd,
@@ -1572,6 +1698,10 @@ async function startServer() {
       res.status(404).json({ error: 'Deployment not found.' });
       return;
     }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to access this terminal.' });
+      return;
+    }
     const { text } = req.body as { text?: string };
     if (typeof text !== 'string') {
       res.status(400).json({ error: 'Input text is required.' });
@@ -1589,6 +1719,10 @@ async function startServer() {
     const dep = state.deployments.find((d) => d.id === req.params.id);
     if (!dep) {
       res.status(404).json({ error: 'Deployment not found.' });
+      return;
+    }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to control this deployment.' });
       return;
     }
     const { action } = req.body as { action?: 'start' | 'stop' | 'restart' | 'redeploy' };
@@ -1613,25 +1747,52 @@ async function startServer() {
         return;
       }
       const botDir = getBotDir(dep.id);
-      if (!fs.existsSync(botDir)) {
+      const hasNodeModulesOrPy =
+        fs.existsSync(botDir) &&
+        (!fs.existsSync(path.join(botDir, 'package.json')) || fs.existsSync(path.join(botDir, 'node_modules')));
+      if (!fs.existsSync(botDir) || !hasNodeModulesOrPy) {
         void triggerDeploymentPipeline(dep);
       } else if (!isRunning(dep.id, dep.pid)) {
         try {
           writeDotEnvFile(botDir, dep.settings.envVars);
-          const bp = startProcess(dep.id, dep.settings.startCommand, {
+          const resolved = resolveDeploymentCommands(botDir, dep.settings);
+          dep.settings.startCommand = resolved.startCommand;
+          const bp = startProcess(dep.id, resolved.startCommand, {
             numericId: dep.numericId,
-            autoRestart: dep.settings.restartPolicy !== 'never',
+            restartPolicy: dep.settings.restartPolicy,
+            memoryLimitMb: dep.memoryLimitMb,
             env: buildEnvMap(dep.settings.envVars),
           });
-          dep.status = 'online';
-          dep.pid = bp.pid;
-          dep.uptimeSeconds = 1;
-          appendLog(
-            dep,
-            'success',
-            'runtime',
-            `Started bot process (PID ${bp.pid}): ${dep.settings.startCommand}`
-          );
+          const stability = await waitForProcessStability(dep.id, 1000);
+          if (stability.alive) {
+            dep.status = 'online';
+            dep.pid = bp.pid;
+            dep.uptimeSeconds = 1;
+            appendLog(
+              dep,
+              'success',
+              'runtime',
+              `Started bot process (PID ${bp.pid}): ${resolved.startCommand}`
+            );
+          } else if (isAutoRestarting(dep.id)) {
+            dep.status = 'building';
+            dep.pid = null;
+            appendLog(
+              dep,
+              'warn',
+              'runtime',
+              `Process exited right after start (code ${stability.exitCode ?? 'null'}); auto-restart scheduled.`
+            );
+          } else {
+            dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+            dep.pid = null;
+            appendLog(
+              dep,
+              dep.status === 'failed' ? 'error' : 'warn',
+              'runtime',
+              `Process exited right after start with code ${stability.exitCode ?? 'null'}.`
+            );
+          }
         } catch (err) {
           dep.status = 'failed';
           appendLog(
@@ -1656,20 +1817,47 @@ async function startServer() {
         stopProcess(dep.id);
         await new Promise((r) => setTimeout(r, 400));
         const botDir = getBotDir(dep.id);
-        if (!fs.existsSync(botDir)) {
+        const hasNodeModulesOrPy =
+          fs.existsSync(botDir) &&
+          (!fs.existsSync(path.join(botDir, 'package.json')) || fs.existsSync(path.join(botDir, 'node_modules')));
+        if (!fs.existsSync(botDir) || !hasNodeModulesOrPy) {
           void triggerDeploymentPipeline(dep);
         } else {
           try {
             writeDotEnvFile(botDir, dep.settings.envVars);
-            const bp = startProcess(dep.id, dep.settings.startCommand, {
+            const resolved = resolveDeploymentCommands(botDir, dep.settings);
+            dep.settings.startCommand = resolved.startCommand;
+            const bp = startProcess(dep.id, resolved.startCommand, {
               numericId: dep.numericId,
-              autoRestart: dep.settings.restartPolicy !== 'never',
+              restartPolicy: dep.settings.restartPolicy,
+              memoryLimitMb: dep.memoryLimitMb,
               env: buildEnvMap(dep.settings.envVars),
             });
-            dep.status = 'online';
-            dep.pid = bp.pid;
-            dep.uptimeSeconds = 1;
-            appendLog(dep, 'info', 'runtime', `Restarted bot process (PID ${bp.pid}).`);
+            const stability = await waitForProcessStability(dep.id, 1000);
+            if (stability.alive) {
+              dep.status = 'online';
+              dep.pid = bp.pid;
+              dep.uptimeSeconds = 1;
+              appendLog(dep, 'info', 'runtime', `Restarted bot process (PID ${bp.pid}).`);
+            } else if (isAutoRestarting(dep.id)) {
+              dep.status = 'building';
+              dep.pid = null;
+              appendLog(
+                dep,
+                'warn',
+                'runtime',
+                `Process exited right after restart (code ${stability.exitCode ?? 'null'}); auto-restart scheduled.`
+              );
+            } else {
+              dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+              dep.pid = null;
+              appendLog(
+                dep,
+                dep.status === 'failed' ? 'error' : 'warn',
+                'runtime',
+                `Process exited right after restart with code ${stability.exitCode ?? 'null'}.`
+              );
+            }
           } catch (err) {
             dep.status = 'failed';
             appendLog(
@@ -1696,6 +1884,10 @@ async function startServer() {
     const idx = state.deployments.findIndex((d) => d.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Deployment not found.' });
+      return;
+    }
+    if (!canManageDeployment(req, state.deployments[idx])) {
+      res.status(403).json({ error: 'You do not have permission to delete this deployment.' });
       return;
     }
     const [removed] = state.deployments.splice(idx, 1);

@@ -97,6 +97,8 @@ export interface StartProcessOptions {
   dirKey?: string | number;
   numericId?: number;
   autoRestart?: boolean;
+  restartPolicy?: 'always' | 'on-failure' | 'never';
+  memoryLimitMb?: number;
   env?: Record<string, string>;
 }
 
@@ -191,6 +193,36 @@ export function safeRemoveDir(targetDir: string): void {
   }
 }
 
+export function waitForProcessStability(
+  botId: string,
+  durationMs = 1200
+): Promise<{ alive: boolean; exitCode: number | null }> {
+  return new Promise((resolve) => {
+    const bp = runningProcesses.get(botId);
+    if (!bp) {
+      resolve({ alive: false, exitCode: 1 });
+      return;
+    }
+
+    let settled = false;
+    const onExit = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ alive: false, exitCode: code });
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      processEmitter.off(`exit:${botId}`, onExit);
+      resolve({ alive: isRunning(botId, bp.pid), exitCode: null });
+    }, durationMs);
+
+    processEmitter.once(`exit:${botId}`, onExit);
+  });
+}
+
 export function startProcess(
   botId: string,
   command: string,
@@ -210,25 +242,30 @@ export function startProcess(
   intentionallyStopped.delete(botId);
   restartingIds.delete(botId);
 
+  const heapLimitMb = Math.max(512, Math.min(2048, options.memoryLimitMb || 512));
   const hookPath = path.resolve(process.cwd(), 'server', 'lyrihostBotHook.cjs');
   const nodeOptions = fs.existsSync(hookPath)
-    ? `--require ${JSON.stringify(hookPath)} --max-old-space-size=2048`
-    : '--max-old-space-size=2048';
+    ? `--require ${JSON.stringify(hookPath)} --max-old-space-size=${heapLimitMb}`
+    : `--max-old-space-size=${heapLimitMb}`;
 
+  const hostPort = String(process.env.PORT || 3000);
   const parentEnv: NodeJS.ProcessEnv = { ...process.env };
   delete parentEnv.PORT;
 
+  const assignedPort = String(10000 + (options.numericId || 1));
   const child = spawn(trimmedCmd, {
     cwd: botDir,
     env: {
       ...parentEnv,
-      PORT: String(10000 + (options.numericId || 1)),
+      PORT: assignedPort,
+      LYRIHOST_HOST_PORT: hostPort,
       ...(options.env || {}),
       NODE_ENV: 'production',
       TERM: 'xterm-256color',
       FORCE_COLOR: '1',
       NODE_OPTIONS: nodeOptions,
       NODE_NO_WARNINGS: '1',
+      PYTHONUNBUFFERED: '1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: true,
@@ -263,6 +300,9 @@ export function startProcess(
   child.stdout?.on('data', emitOutput);
   child.stderr?.on('data', emitOutput);
 
+  const effectivePolicy =
+    options.restartPolicy ?? (options.autoRestart === false ? 'never' : 'on-failure');
+
   child.on('exit', (code) => {
     const wasManualStop = intentionallyStopped.has(botId);
     intentionallyStopped.delete(botId);
@@ -278,7 +318,11 @@ export function startProcess(
       return;
     }
 
-    if (options.autoRestart && code !== 0 && code !== null) {
+    const shouldRestart =
+      effectivePolicy === 'always' ||
+      (effectivePolicy === 'on-failure' && code !== 0 && code !== null);
+
+    if (shouldRestart) {
       const now = Date.now();
       const history = (crashTimestamps.get(botId) ?? []).filter((t) => now - t < 25000);
       history.push(now);
@@ -288,11 +332,11 @@ export function startProcess(
         crashTimestamps.delete(botId);
         emitOutput(
           Buffer.from(
-            '\r\n[RUNTIME] Crash loop detected (4 rapid exits in 25s). Auto-restart paused; inspect logs above.\r\n'
+            `\r\n[RUNTIME] Crash loop detected (4 rapid exits in 25s, last exit code ${code ?? 'null'}). Auto-restart paused; inspect logs above.\r\n`
           )
         );
         if (_processExitCallback) {
-          void _processExitCallback(botId, code);
+          void _processExitCallback(botId, code === 0 ? 1 : code);
         }
         return;
       }

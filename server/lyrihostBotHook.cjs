@@ -466,3 +466,33 @@ origProcessOn('uncaughtException', (err) => {
     console.error('[runtime] Uncaught Exception:', err);
   }
 });
+
+/**
+ * 3. Prevent bot web servers from crashing with EADDRINUSE when hardcoding the host platform port (e.g. 3000).
+ */
+try {
+  const net = require('node:net');
+  const hostPort = Number.parseInt(process.env.LYRIHOST_HOST_PORT || '', 10);
+  const assignedPort = Number.parseInt(process.env.PORT || '', 10);
+  if (
+    Number.isInteger(hostPort) &&
+    hostPort > 0 &&
+    Number.isInteger(assignedPort) &&
+    assignedPort > 0 &&
+    hostPort !== assignedPort &&
+    typeof net.Server.prototype.listen === 'function'
+  ) {
+    const origListen = net.Server.prototype.listen;
+    net.Server.prototype.listen = function patchedListen(...args) {
+      if (typeof args[0] === 'number' && args[0] === hostPort) {
+        args[0] = assignedPort;
+      } else if (args[0] && typeof args[0] === 'object' && Number(args[0].port) === hostPort) {
+        args[0] = { ...args[0], port: assignedPort };
+      }
+      return origListen.apply(this, args);
+    };
+  }
+} catch {
+  // ignore net patch failure
+}
+

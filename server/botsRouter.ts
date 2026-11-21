@@ -5,13 +5,23 @@ import {
   ensureBotsDir,
   getBotDir,
   getLogs,
+  isAutoRestarting,
   isRunning,
   safeRemoveDir,
   sendInput,
   startProcess,
   stopProcess,
+  waitForProcessStability,
 } from './processManager.ts';
-import { buildEnvMap, cloneRepository, pullRepository, runShellStep, sanitizeRepoUrl, writeDotEnvFile } from './gitRunner.ts';
+import {
+  buildEnvMap,
+  cloneRepository,
+  pullRepository,
+  resolveDeploymentCommands,
+  runShellStep,
+  sanitizeRepoUrl,
+  writeDotEnvFile,
+} from './gitRunner.ts';
 import {
   buildEmptyTelemetryHistory,
   makeId,
@@ -317,7 +327,7 @@ export function createBotsRouter(
   });
 
   // Start bot process
-  router.post('/bots/:id/start', (req, res) => {
+  router.post('/bots/:id/start', async (req, res) => {
     const state = getState();
     const dep = findDeploymentByParam(state, req.params.id);
     if (!dep) {
@@ -336,16 +346,30 @@ export function createBotsRouter(
 
     try {
       writeDotEnvFile(botDir, dep.settings.envVars);
-      const bp = startProcess(dep.id, dep.settings.startCommand, {
+      const resolved = resolveDeploymentCommands(botDir, dep.settings);
+      dep.settings.startCommand = resolved.startCommand;
+      const bp = startProcess(dep.id, resolved.startCommand, {
         numericId: dep.numericId,
-        autoRestart: dep.settings.restartPolicy !== 'never',
+        restartPolicy: dep.settings.restartPolicy,
+        memoryLimitMb: dep.memoryLimitMb,
         env: buildEnvMap(dep.settings.envVars),
       });
-      dep.status = 'online';
-      dep.pid = bp.pid;
-      dep.uptimeSeconds = 1;
-      dep.lastDeployedAt = nowIso();
-      pushDeploymentLog(dep, 'success', 'runtime', `Started process (PID ${bp.pid}): ${dep.settings.startCommand}`);
+      const stability = await waitForProcessStability(dep.id, 1000);
+      if (stability.alive) {
+        dep.status = 'online';
+        dep.pid = bp.pid;
+        dep.uptimeSeconds = 1;
+        dep.lastDeployedAt = nowIso();
+        pushDeploymentLog(dep, 'success', 'runtime', `Started process (PID ${bp.pid}): ${resolved.startCommand}`);
+      } else if (isAutoRestarting(dep.id)) {
+        dep.status = 'building';
+        dep.pid = null;
+        pushDeploymentLog(dep, 'warn', 'runtime', `Process exited right after start (code ${stability.exitCode ?? 'null'}); auto-restart scheduled.`);
+      } else {
+        dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+        dep.pid = null;
+        pushDeploymentLog(dep, dep.status === 'failed' ? 'error' : 'warn', 'runtime', `Process exited with code ${stability.exitCode ?? 'null'}.`);
+      }
       invalidateCache();
       saveState();
       broadcast();
@@ -398,15 +422,29 @@ export function createBotsRouter(
 
     try {
       writeDotEnvFile(botDir, dep.settings.envVars);
-      const bp = startProcess(dep.id, dep.settings.startCommand, {
+      const resolved = resolveDeploymentCommands(botDir, dep.settings);
+      dep.settings.startCommand = resolved.startCommand;
+      const bp = startProcess(dep.id, resolved.startCommand, {
         numericId: dep.numericId,
-        autoRestart: dep.settings.restartPolicy !== 'never',
+        restartPolicy: dep.settings.restartPolicy,
+        memoryLimitMb: dep.memoryLimitMb,
         env: buildEnvMap(dep.settings.envVars),
       });
-      dep.status = 'online';
-      dep.pid = bp.pid;
-      dep.uptimeSeconds = 1;
-      pushDeploymentLog(dep, 'info', 'runtime', `Restarted process (PID ${bp.pid})`);
+      const stability = await waitForProcessStability(dep.id, 1000);
+      if (stability.alive) {
+        dep.status = 'online';
+        dep.pid = bp.pid;
+        dep.uptimeSeconds = 1;
+        pushDeploymentLog(dep, 'info', 'runtime', `Restarted process (PID ${bp.pid})`);
+      } else if (isAutoRestarting(dep.id)) {
+        dep.status = 'building';
+        dep.pid = null;
+        pushDeploymentLog(dep, 'warn', 'runtime', `Restart exited (code ${stability.exitCode ?? 'null'}); auto-restart scheduled.`);
+      } else {
+        dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+        dep.pid = null;
+        pushDeploymentLog(dep, dep.status === 'failed' ? 'error' : 'warn', 'runtime', `Restart exited with code ${stability.exitCode ?? 'null'}.`);
+      }
       invalidateCache();
       saveState();
       broadcast();
@@ -433,14 +471,17 @@ export function createBotsRouter(
       return;
     }
 
-    let installCmd = dep.settings.installCommand.trim();
-    if (!installCmd) {
-      const hasYarn = fs.existsSync(`${botDir}/yarn.lock`);
-      const hasPnpm = fs.existsSync(`${botDir}/pnpm-lock.yaml`);
-      installCmd = hasPnpm ? 'pnpm install' : hasYarn ? 'yarn install' : 'npm install --legacy-peer-deps --ignore-engines';
-    }
+    const resolved = resolveDeploymentCommands(botDir, dep.settings);
+    const installCmd = resolved.installCommand || 'npm install --legacy-peer-deps --ignore-engines';
 
-    const result = await runShellStep(installCmd, botDir, buildEnvMap(dep.settings.envVars));
+    let result = await runShellStep(installCmd, botDir, buildEnvMap(dep.settings.envVars));
+    if (!result.ok && /\b(npm|yarn|pnpm|bun)\b/i.test(installCmd) && fs.existsSync(`${botDir}/package.json`)) {
+      result = await runShellStep(
+        'npm install --legacy-peer-deps --ignore-engines --ignore-scripts --no-audit --no-fund',
+        botDir,
+        buildEnvMap(dep.settings.envVars)
+      );
+    }
     const output = result.output || 'Done.';
     pushDeploymentLog(dep, result.ok ? 'success' : 'error', 'install', output.slice(-600));
     saveState();

@@ -1,8 +1,38 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { EnvVarEntry } from '../src/types/lyrihost.ts';
+import type { BotSettings, EnvVarEntry, RuntimeEnvironment } from '../src/types/lyrihost.ts';
 import { safeRemoveDir } from './processManager.ts';
+
+const GIT_HTTPS_REWRITE_ENV: Record<string, string> = {
+  GIT_TERMINAL_PROMPT: '0',
+  GCM_INTERACTIVE: 'never',
+  GIT_ASKPASS: '',
+  GIT_SSH_COMMAND: 'ssh -o StrictHostKeyChecking=no -o BatchMode=yes',
+  GIT_CONFIG_COUNT: '4',
+  GIT_CONFIG_KEY_0: 'url.https://github.com/.insteadOf',
+  GIT_CONFIG_VALUE_0: 'ssh://git@github.com/',
+  GIT_CONFIG_KEY_1: 'url.https://github.com/.insteadOf',
+  GIT_CONFIG_VALUE_1: 'git+ssh://git@github.com/',
+  GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
+  GIT_CONFIG_VALUE_2: 'git@github.com:',
+  GIT_CONFIG_KEY_3: 'url.https://github.com/.insteadOf',
+  GIT_CONFIG_VALUE_3: 'git://github.com/',
+};
+
+export function commandExists(bin: string): boolean {
+  const clean = bin.trim();
+  if (!clean || !/^[A-Za-z0-9_.-]+$/.test(clean)) return false;
+  try {
+    execFileSync(process.platform === 'win32' ? 'where' : 'which', [clean], {
+      stdio: 'ignore',
+      timeout: 2000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function buildCloneUrl(gitUrl: string, gitToken?: string | null): string {
   const trimmed = gitUrl.trim();
@@ -18,15 +48,36 @@ export function buildCloneUrl(gitUrl: string, gitToken?: string | null): string 
 }
 
 export function sanitizeRepoUrl(input: string): string | null {
-  const trimmed = input.trim();
+  let trimmed = input.trim();
   if (!trimmed) return null;
-  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(trimmed)) {
-    return `https://github.com/${trimmed}.git`;
+
+  // Support git+https:// or git+ssh:// wrappers
+  if (/^git\+https?:\/\//i.test(trimmed)) {
+    trimmed = trimmed.replace(/^git\+/i, '');
   }
+  const sshMatch = trimmed.match(/^(?:git\+ssh:\/\/)?git@([^:/]+):(.+)$/i);
+  if (sshMatch) {
+    const host = sshMatch[1];
+    const repoPath = sshMatch[2].replace(/^\/+/, '');
+    trimmed = `https://${host}/${repoPath}`;
+  }
+
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(trimmed)) {
+    return `https://github.com/${trimmed.replace(/\.git$/i, '')}.git`;
+  }
+
   const normalized = /^github\.com\//i.test(trimmed) ? `https://${trimmed}` : trimmed;
   try {
     const u = new URL(normalized);
     if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    // Strip /tree/<branch> or /blob/<branch>/... if user pasted a browser URL
+    if (u.hostname.toLowerCase().includes('github.com')) {
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        const repoPart = parts[1].replace(/\.git$/i, '');
+        return `https://github.com/${parts[0]}/${repoPart}.git`;
+      }
+    }
     return u.toString();
   } catch {
     return null;
@@ -49,17 +100,15 @@ function runGitClone(
       'git',
       safeArgs,
       {
-        timeout: 120000,
+        timeout: 150000,
         signal,
         env: {
           ...process.env,
-          GIT_TERMINAL_PROMPT: '0',
-          GCM_INTERACTIVE: 'never',
-          GIT_ASKPASS: '',
+          ...GIT_HTTPS_REWRITE_ENV,
         },
       },
       (err, stdout, stderr) => {
-        const combined = redactSecret(`${stdout || ''}${stderr || ''}`.trim(), token);
+        const combined = redactSecret(`${stdout || ''}\n${stderr || ''}`.trim(), token);
         if (err) {
           resolve({ ok: false, output: combined || redactSecret(err.message, token) });
         } else {
@@ -87,41 +136,60 @@ export async function cloneRepository(
 
   const branch =
     options.branch && /^[A-Za-z0-9_./-]+$/.test(options.branch) ? options.branch : undefined;
-  const args = ['clone', '--depth', '1'];
+  const baseArgs = ['clone', '--depth', '1'];
   if (branch) {
-    args.push('--branch', branch);
+    baseArgs.push('--branch', branch);
   }
-  args.push(cloneUrl, targetDir);
 
-  let res = await runGitClone(args, options.signal, options.gitToken);
+  let res = await runGitClone([...baseArgs, cloneUrl, targetDir], options.signal, options.gitToken);
 
-  // Retry once automatically on transient network/TLS hiccups
-  if (
-    !res.ok &&
-    !options.signal?.aborted &&
-    /timed out|RPC failed|Could not resolve host|Connection reset|HTTP 5\d\d|TLS/i.test(res.output)
-  ) {
+  // Retry automatically on transient network/TLS/HTTP2 stream hiccups with HTTP/1.1 + larger postBuffer
+  const transientPattern =
+    /timed out|RPC failed|Could not resolve host|Connection reset|HTTP 5\d\d|TLS|GnuTLS|HTTP\/2|early EOF|unexpected disconnect|Failed to connect|unable to access|index-pack failed|fetch-pack/i;
+  if (!res.ok && !options.signal?.aborted && transientPattern.test(res.output)) {
     if (fs.existsSync(targetDir)) {
       safeRemoveDir(targetDir);
     }
     await new Promise((r) => setTimeout(r, 1500));
-    res = await runGitClone(args, options.signal, options.gitToken);
+    res = await runGitClone(
+      [
+        '-c',
+        'http.version=HTTP/1.1',
+        '-c',
+        'http.postBuffer=524288000',
+        '-c',
+        'http.lowSpeedLimit=1000',
+        '-c',
+        'http.lowSpeedTime=30',
+        ...baseArgs,
+        cloneUrl,
+        targetDir,
+      ],
+      options.signal,
+      options.gitToken
+    );
   }
 
   // If specified branch wasn't found, fall back to the repository's default branch
   if (
     !res.ok &&
     branch &&
-    /Remote branch .+ not found|did not match any file\(s\) known to git/i.test(res.output)
+    /Remote branch .+ not found|Could not find remote branch|did not match any file\(s\) known to git/i.test(
+      res.output
+    )
   ) {
     if (fs.existsSync(targetDir)) {
       safeRemoveDir(targetDir);
     }
-    res = await runGitClone(['clone', '--depth', '1', cloneUrl, targetDir], options.signal, options.gitToken);
+    res = await runGitClone(
+      ['-c', 'http.version=HTTP/1.1', 'clone', '--depth', '1', cloneUrl, targetDir],
+      options.signal,
+      options.gitToken
+    );
   }
 
   if (!res.ok) {
-    if (/could not read Username|Authentication failed|Repository not found/i.test(res.output)) {
+    if (/could not read Username|Authentication failed|Repository not found|terminal prompts disabled/i.test(res.output)) {
       return {
         ok: false,
         output: `Repository not found or requires GitHub access token (${safeUrl}). Verify owner/repo is public or configure a GitHub Token in Platform Settings.`,
@@ -162,13 +230,11 @@ export function pullRepository(
         timeout: 60000,
         env: {
           ...process.env,
-          GIT_TERMINAL_PROMPT: '0',
-          GCM_INTERACTIVE: 'never',
-          GIT_ASKPASS: '',
+          ...GIT_HTTPS_REWRITE_ENV,
         },
       },
       (err, stdout, stderr) => {
-        const output = redactSecret(`${stdout || ''}${stderr || ''}`.trim(), gitToken) || 'Already up to date.';
+        const output = redactSecret(`${stdout || ''}\n${stderr || ''}`.trim(), gitToken) || 'Already up to date.';
         resolve({ ok: !err, output });
       }
     );
@@ -202,6 +268,152 @@ export function getRepoHeadInfo(botDir: string): Promise<{ commitSha: string; br
   });
 }
 
+export interface ResolvedBotCommands {
+  installCommand: string;
+  buildCommand: string;
+  startCommand: string;
+  runtime: RuntimeEnvironment;
+  notes: string[];
+}
+
+export function resolveDeploymentCommands(
+  botDir: string,
+  settings: Pick<BotSettings, 'installCommand' | 'buildCommand' | 'startCommand' | 'runtime'>
+): ResolvedBotCommands {
+  const notes: string[] = [];
+  let installCommand = (settings.installCommand || '').trim();
+  let buildCommand = (settings.buildCommand || '').trim();
+  let startCommand = (settings.startCommand || '').trim() || 'npm start';
+  let runtime: RuntimeEnvironment = settings.runtime || 'node-20';
+
+  const pkgPath = path.join(botDir, 'package.json');
+  const reqPath = path.join(botDir, 'requirements.txt');
+  const pyprojPath = path.join(botDir, 'pyproject.toml');
+
+  const hasPkg = fs.existsSync(pkgPath);
+  const hasReq = fs.existsSync(reqPath);
+  const hasPyproj = fs.existsSync(pyprojPath);
+  const pyEntries = ['bot.py', 'main.py', 'app.py', 'run.py', 'src/bot.py', 'src/main.py'];
+  const foundPyEntry =
+    pyEntries.find((rel) => fs.existsSync(path.join(botDir, rel))) ||
+    fs.readdirSync(botDir).find((f) => f.endsWith('.py'));
+
+  // Normalize unavailable docker runtime when Node/Python project files exist
+  if (runtime === 'docker' && !commandExists('docker')) {
+    if (hasPkg) {
+      runtime = 'node-20';
+      notes.push('Docker daemon unavailable in worker sandbox; switching to native Node.js execution.');
+    } else if (hasReq || hasPyproj || foundPyEntry) {
+      runtime = 'python-3.12';
+      notes.push('Docker daemon unavailable in worker sandbox; switching to Python 3 execution.');
+    }
+  }
+
+  if (hasPkg) {
+    let pkg: {
+      main?: string;
+      scripts?: Record<string, string>;
+    } = {};
+    try {
+      pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as typeof pkg;
+    } catch {
+      pkg = {};
+    }
+
+    // Adapt package managers not installed in runtime (e.g. pnpm/yarn/bun -> npm fallback)
+    if (/^\s*pnpm\b/i.test(installCommand) && !commandExists('pnpm')) {
+      installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
+      notes.push('pnpm binary not present; adapted install command to npm.');
+    } else if (/^\s*yarn\b/i.test(installCommand) && !commandExists('yarn')) {
+      installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
+      notes.push('yarn binary not present; adapted install command to npm.');
+    } else if (/^\s*bun\b/i.test(installCommand) && !commandExists('bun')) {
+      installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
+      notes.push('bun binary not present; adapted install command to npm.');
+    } else if (/^\s*npm\s+ci\b/i.test(installCommand) && !fs.existsSync(path.join(botDir, 'package-lock.json'))) {
+      installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
+      notes.push('package-lock.json missing; switched npm ci to npm install.');
+    } else if (!installCommand && (pkg.scripts || fs.existsSync(pkgPath))) {
+      installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
+    }
+
+    if (/^\s*pnpm\b/i.test(buildCommand) && !commandExists('pnpm')) {
+      buildCommand = buildCommand.replace(/^\s*pnpm\b/i, 'npm run');
+    } else if (/^\s*yarn\b/i.test(buildCommand) && !commandExists('yarn')) {
+      buildCommand = buildCommand.replace(/^\s*yarn\b/i, 'npm run');
+    } else if (/^\s*bun\b/i.test(buildCommand) && !commandExists('bun')) {
+      buildCommand = buildCommand.replace(/^\s*bun\b/i, 'npm');
+    }
+
+    if (buildCommand.startsWith('docker ')) {
+      buildCommand = pkg.scripts?.build ? 'npm run build' : '';
+    }
+
+    // Resolve start command when `package.json` has no `scripts.start` or uses missing runtime binary
+    const isDefaultStart =
+      /^(npm\s+start|npm\s+run\s+start|yarn\s+start|pnpm\s+start|bun\s+run\s+start|docker\s+run)/i.test(
+        startCommand
+      );
+
+    if (isDefaultStart && (!pkg.scripts || !pkg.scripts.start)) {
+      const nodeCandidates = [
+        pkg.main,
+        'index.js',
+        'bot.js',
+        'main.js',
+        'app.js',
+        'server.js',
+        'src/index.js',
+        'src/bot.js',
+      ].filter((c): c is string => Boolean(c));
+
+      const matchedEntry = nodeCandidates.find((rel) => fs.existsSync(path.join(botDir, rel)));
+      if (matchedEntry) {
+        startCommand = `node ${JSON.stringify(matchedEntry)}`;
+        notes.push(`package.json has no "start" script; auto-selected entrypoint ${matchedEntry}.`);
+      }
+    } else if (/^\s*bun\s+(run\s+)?start\b/i.test(startCommand) && !commandExists('bun')) {
+      startCommand = 'npm start';
+      notes.push('bun binary not present; adapted start command to npm start.');
+    } else if (/^\s*yarn\s+start\b/i.test(startCommand) && !commandExists('yarn')) {
+      startCommand = 'npm start';
+    } else if (/^\s*pnpm\s+start\b/i.test(startCommand) && !commandExists('pnpm')) {
+      startCommand = 'npm start';
+    }
+  } else if (hasReq || hasPyproj || foundPyEntry) {
+    runtime = 'python-3.12';
+    const pyBin = commandExists('python3') ? 'python3' : 'python';
+
+    if (!installCommand || /^\s*(npm|yarn|pnpm|bun)\b/i.test(installCommand)) {
+      if (hasReq) {
+        installCommand = `${pyBin} -m pip install --break-system-packages -r requirements.txt || pip3 install --break-system-packages -r requirements.txt`;
+        notes.push('Detected Python repository; adapted install command to pip requirements.txt.');
+      } else {
+        installCommand = '';
+      }
+    }
+
+    if (buildCommand.startsWith('npm') || buildCommand.startsWith('docker')) {
+      buildCommand = '';
+    }
+
+    if (/^\s*(npm|yarn|pnpm|bun|docker)\b/i.test(startCommand) && foundPyEntry) {
+      startCommand = `${pyBin} ${JSON.stringify(foundPyEntry)}`;
+      notes.push(`Detected Python entrypoint (${foundPyEntry}); adapted start command.`);
+    }
+  }
+
+  // Ensure `python` works even if only `python3` is in PATH
+  if (/^\s*python\s+/i.test(startCommand) && !commandExists('python') && commandExists('python3')) {
+    startCommand = startCommand.replace(/^\s*python\s+/i, 'python3 ');
+  }
+  if (/^\s*pip\s+/i.test(installCommand) && !commandExists('pip') && commandExists('pip3')) {
+    installCommand = installCommand.replace(/^\s*pip\s+/i, 'pip3 ');
+  }
+
+  return { installCommand, buildCommand, startCommand, runtime, notes };
+}
+
 export function runShellStep(
   command: string,
   cwd: string,
@@ -220,11 +432,15 @@ export function runShellStep(
       cwd,
       env: {
         ...process.env,
+        ...GIT_HTTPS_REWRITE_ENV,
         npm_config_yes: 'true',
         npm_config_audit: 'false',
         npm_config_fund: 'false',
+        npm_config_prefer_offline: 'false',
         PUPPETEER_SKIP_DOWNLOAD: 'true',
         SHARP_IGNORE_GLOBAL_LIBVIPS: '1',
+        PYTHONUNBUFFERED: '1',
+        PIP_DISABLE_PIP_VERSION_CHECK: '1',
         ...env,
       },
       shell: true,
@@ -321,3 +537,4 @@ export function writeDotEnvFile(botDir: string, envVars: EnvVarEntry[]): void {
   if (lines.length === 0) return;
   fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n', 'utf-8');
 }
+

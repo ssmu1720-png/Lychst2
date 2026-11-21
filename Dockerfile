@@ -1,18 +1,20 @@
 FROM node:22-bookworm-slim
 
-# System tools required for cloning bot repositories, Python bots, and native builds
+# System tools required for cloning bot repositories, Python bots, media processing, and native builds
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
+    ffmpeg \
     python3 \
+    python-is-python3 \
     python3-pip \
+    python3-venv \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Create Hugging Face Spaces compatible non-root user (uid 1000).
-# node base image already ships a "node" user with uid 1000, so remove it first.
-RUN userdel -r node && useradd -m -u 1000 user
+# Create Hugging Face Spaces compatible non-root user (uid 1000)
+RUN useradd -m -u 1000 user
 
 WORKDIR /app
 

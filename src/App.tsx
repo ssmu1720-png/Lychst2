@@ -814,6 +814,7 @@ export default function App() {
 
         {route === 'inspector' && selectedBot && (
           <BotInspectorView
+            authToken={authToken}
             deployment={selectedBot}
             onBack={() => setRoute('dashboard')}
             onUpdated={(updated) => {

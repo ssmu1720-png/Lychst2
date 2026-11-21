@@ -31,6 +31,7 @@ import {
 } from '../types/lyrihost';
 
 interface BotInspectorViewProps {
+  authToken: string;
   deployment: BotDeployment;
   onBack: () => void;
   onUpdated: (updated: BotDeployment) => void;
@@ -51,6 +52,7 @@ function formatTime(iso: string): string {
 }
 
 export function BotInspectorView({
+  authToken,
   deployment,
   onBack,
   onUpdated,
@@ -94,7 +96,10 @@ export function BotInspectorView({
     try {
       const resp = await fetch(`/api/deployments/${deployment.id}/action`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({ action }),
       });
       const data = await resp.json();
@@ -116,7 +121,10 @@ export function BotInspectorView({
     try {
       const resp = await fetch(`/api/deployments/${deployment.id}/settings`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({ settings: draftSettings, redeploy }),
       });
       const data = await resp.json();
@@ -145,6 +153,7 @@ export function BotInspectorView({
     try {
       const resp = await fetch(`/api/deployments/${deployment.id}/rescan`, {
         method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'GitHub rescan failed.');
@@ -168,6 +177,7 @@ export function BotInspectorView({
     try {
       const resp = await fetch(`/api/deployments/${deployment.id}`, {
         method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
       });
       if (!resp.ok) throw new Error('Failed to delete deployment.');
       onDeleted(deployment.id);
