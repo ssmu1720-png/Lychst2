@@ -377,13 +377,7 @@ async function sendViaBrevoApi(params: {
     process.env.BREVO_FROM_EMAIL?.trim() ||
     process.env.MAIL_FROM_EMAIL?.trim() ||
     process.env.SMTP_USER?.trim() ||
-    '';
-
-  if (!rawFrom) {
-    throw new Error(
-      'BREVO_FROM_EMAIL (e.g. "Lyrihost <your-verified-gmail@gmail.com>") is required when using BREVO_API_KEY.'
-    );
-  }
+    'Lyrihost <sharksam004@gmail.com>';
 
   const sender = parseFromHeader(rawFrom);
   const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
