@@ -115,7 +115,7 @@ export function TemplatesView({
     setStartCmd(tpl.startCommand);
     const initialEnv: Record<string, string> = {};
     for (const field of tpl.defaultEnvVars) {
-      initialEnv[field.key] = field.key === 'PREFIX' ? '.' : '';
+      initialEnv[field.key] = field.key === 'PREFIX' ? '.' : field.key === 'MODE' ? 'public' : '';
     }
     setEnvValues(initialEnv);
     setDeployError(null);

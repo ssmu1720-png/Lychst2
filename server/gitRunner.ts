@@ -432,6 +432,8 @@ export function runShellStep(
       cwd,
       env: {
         ...process.env,
+        NODE_ENV: 'development',
+        npm_config_production: 'false',
         ...GIT_HTTPS_REWRITE_ENV,
         npm_config_yes: 'true',
         npm_config_audit: 'false',
@@ -523,18 +525,127 @@ export function buildEnvMap(envVars: EnvVarEntry[]): Record<string, string> {
     if (entry.value === '••••••••••••••••••••') continue;
     map[key] = entry.value;
   }
+
+  // Sync Session aliases across templates (SESSION_ID <-> SESSION)
   if (map.SESSION_ID && !map.SESSION) {
     map.SESSION = map.SESSION_ID;
   } else if (map.SESSION && !map.SESSION_ID) {
     map.SESSION_ID = map.SESSION;
   }
+
+  // Sync Prefix aliases across templates (PREFIX <-> BOT_PREFIX <-> PREFIXES)
+  const effectivePrefix = map.PREFIX || map.BOT_PREFIX || map.PREFIXES || '';
+  if (effectivePrefix) {
+    if (!map.PREFIX) map.PREFIX = effectivePrefix;
+    if (!map.BOT_PREFIX) map.BOT_PREFIX = effectivePrefix;
+    if (!map.PREFIXES) map.PREFIXES = effectivePrefix;
+  }
+
+  // Sync Owner aliases across templates (OWNER_NUMBER <-> DEV)
+  if (map.OWNER_NUMBER && !map.DEV) {
+    map.DEV = map.OWNER_NUMBER;
+  } else if (map.DEV && !map.OWNER_NUMBER) {
+    map.OWNER_NUMBER = map.DEV;
+  }
+
+  // Sync Bot Mode aliases across templates (MODE <-> BOT_MODE <-> WORK_TYPE <-> WORKTYPE)
+  const effectiveMode = map.MODE || map.BOT_MODE || map.WORK_TYPE || map.WORKTYPE || '';
+  if (effectiveMode) {
+    if (!map.MODE) map.MODE = effectiveMode;
+    if (!map.BOT_MODE) map.BOT_MODE = effectiveMode;
+    if (!map.WORK_TYPE) map.WORK_TYPE = effectiveMode;
+    if (!map.WORKTYPE) map.WORKTYPE = effectiveMode;
+  }
+
   return map;
+}
+
+function mergeEnvFile(filePath: string, map: Record<string, string>): void {
+  const merged: Record<string, string> = {};
+  if (fs.existsSync(filePath)) {
+    const existing = fs.readFileSync(filePath, 'utf-8');
+    for (const rawLine of existing.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq === -1) continue;
+      const k = line.slice(0, eq).trim();
+      const v = line.slice(eq + 1).trim();
+      if (k) merged[k] = v;
+    }
+  }
+  for (const [k, v] of Object.entries(map)) {
+    if (v !== '') {
+      merged[k] = JSON.stringify(v);
+    } else if (!(k in merged)) {
+      merged[k] = '""';
+    }
+  }
+  const lines = Object.entries(merged).map(([k, v]) => `${k}=${v}`);
+  if (lines.length > 0) {
+    fs.writeFileSync(filePath, lines.join('\n') + '\n', 'utf-8');
+  }
 }
 
 export function writeDotEnvFile(botDir: string, envVars: EnvVarEntry[]): void {
   const map = buildEnvMap(envVars);
   const lines = Object.entries(map).map(([k, v]) => `${k}=${JSON.stringify(v)}`);
-  if (lines.length === 0) return;
-  fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n', 'utf-8');
+  if (lines.length > 0) {
+    fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n', 'utf-8');
+  }
+
+  // Sync repos that load set.env (e.g. Keith) or config.env explicitly
+  for (const altEnv of ['set.env', 'config.env']) {
+    const altPath = path.join(botDir, altEnv);
+    if (fs.existsSync(altPath) && lines.length > 0) {
+      mergeEnvFile(altPath, map);
+    }
+  }
+
+  // Sync ELITE-PRO-V1 local database settings/owner JSON when present
+  if (fs.existsSync(path.join(botDir, 'ElitePro.js'))) {
+    try {
+      const dbDir = path.join(botDir, 'database');
+      fs.mkdirSync(dbDir, { recursive: true });
+      const settingsPath = path.join(dbDir, 'settings.json');
+      let currentSettings: Record<string, unknown> = {};
+      if (fs.existsSync(settingsPath)) {
+        try {
+          currentSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) as Record<string, unknown>;
+        } catch {
+          currentSettings = {};
+        }
+      }
+      if (map.MODE) {
+        currentSettings.mode = map.MODE.toLowerCase();
+      } else if (!currentSettings.mode) {
+        currentSettings.mode = 'public';
+      }
+      if (map.PREFIX) {
+        currentSettings.prefix = map.PREFIX;
+      }
+      fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2) + '\n', 'utf-8');
+
+      if (map.OWNER_NUMBER) {
+        const ownerPath = path.join(dbDir, 'owner.json');
+        let owners: string[] = [];
+        if (fs.existsSync(ownerPath)) {
+          try {
+            const parsed = JSON.parse(fs.readFileSync(ownerPath, 'utf-8'));
+            if (Array.isArray(parsed)) owners = parsed.map(String);
+          } catch {
+            owners = [];
+          }
+        }
+        const digits = map.OWNER_NUMBER.replace(/\D/g, '');
+        if (digits && !owners.includes(digits)) {
+          owners.push(digits);
+          fs.writeFileSync(ownerPath, JSON.stringify(owners, null, 2) + '\n', 'utf-8');
+        }
+      }
+    } catch {
+      // ignore non-critical JSON sync error
+    }
+  }
 }
 

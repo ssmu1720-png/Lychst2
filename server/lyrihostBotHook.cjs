@@ -147,9 +147,59 @@ function logTransientNotice(err) {
   console.warn(`[runtime] Suppressed transient WhatsApp socket retry (${code ? `${code} ` : ''}${msg}).`);
 }
 
-let cachedWaVersion = [2, 3000, 1055376512];
+let cachedWaVersion = [2, 3000, 1055718978];
 let versionRefreshStarted = false;
+let swRefreshStarted = false;
 let loggedVersionUpgrade = false;
+
+function refreshWaVersionFromWhatsAppWeb() {
+  if (swRefreshStarted) return;
+  swRefreshStarted = true;
+  try {
+    const https = require('node:https');
+    const req = https.get(
+      'https://web.whatsapp.com/sw.js',
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+        timeout: 4500,
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return;
+        }
+        let body = '';
+        res.on('data', (chunk) => {
+          if (body.length < 250000) body += chunk.toString('utf8');
+        });
+        res.on('end', () => {
+          const match =
+            body.match(/client_revision\\?":(\d{8,12})/) ||
+            body.match(/"client_revision":(\d{8,12})/);
+          if (match) {
+            const rev = Number.parseInt(match[1], 10);
+            if (Number.isFinite(rev) && rev > cachedWaVersion[2]) {
+              cachedWaVersion = [2, 3000, rev];
+            }
+          }
+        });
+      }
+    );
+    req.on('error', () => {});
+    req.on('timeout', () => {
+      try {
+        req.destroy();
+      } catch {}
+    });
+  } catch {
+    // ignore background fetch error
+  }
+}
+
+refreshWaVersionFromWhatsAppWeb();
 
 function refreshWaVersionFromModule(loaded) {
   if (versionRefreshStarted || !loaded || typeof loaded !== 'object') return;
@@ -259,12 +309,34 @@ function normalizeIncomingChatUpdate(sock, chatUpdate) {
       msg.message = unwrapBaileysMessageContent(msg.message);
     }
 
-    // Map own @lid JIDs (self-chat / linked devices) to bare @s.whatsapp.net so owner checks succeed
-    if (msg.key && ownBareLid && ownBarePhoneJid) {
-      if (toBareJid(msg.key.remoteJid) === ownBareLid) {
+    // Map own @lid JIDs (self-chat / linked devices) and Baileys v7 *Alt PN JIDs so owner checks succeed
+    if (msg.key) {
+      if (ownBareLid && ownBarePhoneJid) {
+        if (toBareJid(msg.key.remoteJid) === ownBareLid) {
+          msg.key.remoteJid = ownBarePhoneJid;
+        }
+        if (toBareJid(msg.key.participant) === ownBareLid) {
+          msg.key.participant = ownBarePhoneJid;
+        }
+      }
+      if (
+        msg.key.fromMe &&
+        ownBarePhoneJid &&
+        typeof msg.key.remoteJid === 'string' &&
+        msg.key.remoteJid.endsWith('@lid') &&
+        typeof msg.key.remoteJidAlt === 'string' &&
+        toBareJid(msg.key.remoteJidAlt) === ownBarePhoneJid
+      ) {
         msg.key.remoteJid = ownBarePhoneJid;
       }
-      if (toBareJid(msg.key.participant) === ownBareLid) {
+      if (
+        msg.key.fromMe &&
+        ownBarePhoneJid &&
+        typeof msg.key.participant === 'string' &&
+        msg.key.participant.endsWith('@lid') &&
+        typeof msg.key.participantAlt === 'string' &&
+        toBareJid(msg.key.participantAlt) === ownBarePhoneJid
+      ) {
         msg.key.participant = ownBarePhoneJid;
       }
     }
@@ -365,31 +437,98 @@ function wrapSocketFactory(fn) {
         }
       }
 
-      // Guard messages.upsert handlers & ensure sock.user.jid is always populated
-      if (sock.ev && typeof sock.ev.on === 'function' && !sock.ev.__lyrihostWrapped) {
-        const origEvOn = sock.ev.on.bind(sock.ev);
-        sock.ev.on = function patchedEvOn(event, listener) {
-          if (event === 'connection.update' && typeof listener === 'function') {
-            return origEvOn(event, (update) => {
-              syncSocketUserJid(sock);
-              return listener(update);
-            });
+      let lastLoggedConnState = '';
+      const logConnUpdate = (update) => {
+        if (!update || typeof update !== 'object') return;
+        const conn = update.connection;
+        if (conn === 'open' && lastLoggedConnState !== 'open') {
+          lastLoggedConnState = 'open';
+          const jid = (sock.user && (sock.user.jid || sock.user.id)) || 'linked device';
+          console.log(`[runtime] WhatsApp socket connected as ${jid}.`);
+        } else if (update.qr && lastLoggedConnState !== 'qr') {
+          lastLoggedConnState = 'qr';
+          console.log('[runtime] QR code generated — scan via WhatsApp > Linked Devices or set a valid SESSION_ID.');
+        } else if (conn === 'close') {
+          lastLoggedConnState = 'close';
+          const statusCode =
+            update.lastDisconnect &&
+            update.lastDisconnect.error &&
+            update.lastDisconnect.error.output &&
+            update.lastDisconnect.error.output.statusCode;
+          if (statusCode === 401 || statusCode === 403) {
+            console.warn(`[runtime] WhatsApp rejected session (code ${statusCode}). Regenerate SESSION_ID from the pairing site and redeploy.`);
+          } else if (statusCode) {
+            console.warn(`[runtime] WhatsApp connection closed (code ${statusCode}); waiting for reconnect.`);
           }
-          if (event === 'messages.upsert' && typeof listener === 'function') {
-            return origEvOn(event, async (chatUpdate) => {
-              syncSocketUserJid(sock);
-              const singleUpdates = normalizeIncomingChatUpdate(sock, chatUpdate);
-              for (const singleUpdate of singleUpdates) {
-                try {
-                  await listener(singleUpdate);
-                } catch (err) {
-                  console.error('[runtime] Guarded message handler error:', err && err.message ? err.message : err);
+        }
+      };
+
+      // Guard messages.upsert handlers & ensure sock.user.jid is always populated (both ev.on and ev.process)
+      if (sock.ev && !sock.ev.__lyrihostWrapped) {
+        if (typeof sock.ev.on === 'function') {
+          const origEvOn = sock.ev.on.bind(sock.ev);
+          sock.ev.on = function patchedEvOn(event, listener) {
+            if (event === 'connection.update' && typeof listener === 'function') {
+              return origEvOn(event, (update) => {
+                syncSocketUserJid(sock);
+                logConnUpdate(update);
+                return listener(update);
+              });
+            }
+            if (event === 'messages.upsert' && typeof listener === 'function') {
+              return origEvOn(event, async (chatUpdate) => {
+                syncSocketUserJid(sock);
+                const singleUpdates = normalizeIncomingChatUpdate(sock, chatUpdate);
+                for (const singleUpdate of singleUpdates) {
+                  try {
+                    await listener(singleUpdate);
+                  } catch (err) {
+                    console.error('[runtime] Guarded message handler error:', err && err.message ? err.message : err);
+                  }
                 }
+              });
+            }
+            return origEvOn(event, listener);
+          };
+        }
+
+        if (typeof sock.ev.process === 'function') {
+          const origEvProcess = sock.ev.process.bind(sock.ev);
+          sock.ev.process = function patchedEvProcess(handler) {
+            if (typeof handler !== 'function') {
+              return origEvProcess(handler);
+            }
+            return origEvProcess(async (events) => {
+              syncSocketUserJid(sock);
+              if (events && events['connection.update']) {
+                logConnUpdate(events['connection.update']);
               }
+              if (events && events['messages.upsert']) {
+                const singleUpdates = normalizeIncomingChatUpdate(sock, events['messages.upsert']);
+                if (singleUpdates.length === 0) {
+                  const rest = { ...events };
+                  delete rest['messages.upsert'];
+                  if (Object.keys(rest).length === 0) return;
+                  return handler(rest);
+                }
+                for (let i = 0; i < singleUpdates.length; i++) {
+                  const evSlice =
+                    i === 0
+                      ? { ...events, 'messages.upsert': singleUpdates[i] }
+                      : { 'messages.upsert': singleUpdates[i] };
+                  try {
+                    await handler(evSlice);
+                  } catch (err) {
+                    console.error('[runtime] Guarded ev.process handler error:', err && err.message ? err.message : err);
+                  }
+                }
+                return;
+              }
+              return handler(events);
             });
-          }
-          return origEvOn(event, listener);
-        };
+          };
+        }
+
         sock.ev.__lyrihostWrapped = true;
       }
     }
@@ -397,6 +536,43 @@ function wrapSocketFactory(fn) {
   };
   wrapped.__lyrihostWrapped = true;
   return wrapped;
+}
+
+globalThis.__lyrihostWrapSocket = wrapSocketFactory;
+
+if (typeof Module.registerHooks === 'function') {
+  try {
+    Module.registerHooks({
+      load(url, context, nextLoad) {
+        const res = nextLoad(url, context);
+        if (
+          res &&
+          res.format === 'module' &&
+          typeof url === 'string' &&
+          /baileys/i.test(url) &&
+          /\/lib\/Socket\/index\.m?js$/i.test(url) &&
+          res.source
+        ) {
+          let code =
+            typeof res.source === 'string'
+              ? res.source
+              : Buffer.from(res.source).toString('utf8');
+          if (!code.includes('__lyrihostWrapSocket')) {
+            const patched = code.replace(
+              /export\s+default\s+([A-Za-z0-9_$]+)\s*;?/m,
+              'const __lyrihostOrigSock = $1;\nexport default (globalThis.__lyrihostWrapSocket ? globalThis.__lyrihostWrapSocket(__lyrihostOrigSock) : __lyrihostOrigSock);'
+            );
+            if (patched !== code) {
+              return { ...res, source: patched };
+            }
+          }
+        }
+        return res;
+      },
+    });
+  } catch {
+    // Ignore if registerHooks unavailable
+  }
 }
 
 const origModuleLoad = Module._load;
