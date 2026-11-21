@@ -18,6 +18,14 @@ const SHARED_PAAS_DOMAINS = [
 ];
 
 let cachedResendDomains: { domains: string[]; expiresAt: number } | null = null;
+let cachedBrevoHealth: {
+  keyHash: string;
+  platformDisabled: boolean;
+  relayEnabled: boolean | null;
+  accountEmail: string | null;
+  reason: string | null;
+  expiresAt: number;
+} | null = null;
 
 function getResendApiKey(): string {
   return process.env.RESEND_API_KEY?.trim() || '';
@@ -25,6 +33,86 @@ function getResendApiKey(): string {
 
 function getBrevoApiKey(): string {
   return process.env.BREVO_API_KEY?.trim() || '';
+}
+
+async function fetchBrevoHealth(apiKey: string): Promise<{
+  platformDisabled: boolean;
+  relayEnabled: boolean | null;
+  accountEmail: string | null;
+  reason: string | null;
+}> {
+  const now = Date.now();
+  const keyHash = apiKey.slice(-12);
+  if (cachedBrevoHealth && cachedBrevoHealth.keyHash === keyHash && cachedBrevoHealth.expiresAt > now) {
+    return {
+      platformDisabled: cachedBrevoHealth.platformDisabled,
+      relayEnabled: cachedBrevoHealth.relayEnabled,
+      accountEmail: cachedBrevoHealth.accountEmail,
+      reason: cachedBrevoHealth.reason,
+    };
+  }
+
+  let relayEnabled: boolean | null = null;
+  let accountEmail: string | null = null;
+  let platformDisabled = false;
+  let reason: string | null = null;
+
+  try {
+    const [acctResp, evtResp] = await Promise.all([
+      fetch('https://api.brevo.com/v3/account', {
+        headers: { 'api-key': apiKey, Accept: 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      }),
+      fetch('https://api.brevo.com/v3/smtp/statistics/events?limit=10', {
+        headers: { 'api-key': apiKey, Accept: 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      }),
+    ]);
+
+    if (acctResp.ok) {
+      const acct = (await acctResp.json()) as {
+        email?: string;
+        relay?: { enabled?: boolean };
+      };
+      accountEmail = acct.email?.trim() || null;
+      if (typeof acct.relay?.enabled === 'boolean') {
+        relayEnabled = acct.relay.enabled;
+      }
+    }
+
+    if (evtResp.ok) {
+      const evtPayload = (await evtResp.json()) as {
+        events?: Array<{ event?: string; reason?: string; date?: string }>;
+      };
+      const events = evtPayload.events ?? [];
+      const firstDeliveredIdx = events.findIndex((e) => e.event === 'delivered');
+      const relevantEvents =
+        firstDeliveredIdx === -1 ? events : events.slice(0, firstDeliveredIdx);
+      const disabledEvent = relevantEvents.find(
+        (e) =>
+          e.event === 'error' &&
+          typeof e.reason === 'string' &&
+          /sending platform is currently disabled|account.*disabled|suspended/i.test(e.reason)
+      );
+      if (disabledEvent) {
+        platformDisabled = true;
+        reason = disabledEvent.reason || 'Brevo sending platform is currently disabled.';
+      }
+    }
+  } catch {
+    // Ignore transient network errors during health inspection
+  }
+
+  cachedBrevoHealth = {
+    keyHash,
+    platformDisabled,
+    relayEnabled,
+    accountEmail,
+    reason,
+    expiresAt: now + 60 * 1000,
+  };
+
+  return { platformDisabled, relayEnabled, accountEmail, reason };
 }
 
 function getSmtpConfig(): {
@@ -201,12 +289,14 @@ export async function resolveResendFromAddress(): Promise<{
 
 export interface EmailTransportStatus {
   configured: boolean;
-  activeProvider: 'resend-verified' | 'brevo' | 'smtp' | 'resend-sandbox' | 'none';
+  activeProvider: 'resend-verified' | 'brevo' | 'brevo-disabled' | 'smtp' | 'resend-sandbox' | 'none';
   resendConfigured: boolean;
   resendVerifiedDomains: string[];
   resendSandboxOnly: boolean;
   resendFromIgnoredWarning: string | null;
   brevoConfigured: boolean;
+  brevoPlatformDisabled: boolean;
+  brevoWarning: string | null;
   smtpConfigured: boolean;
   smtpHost: string | null;
   railwayDomainDetected: string | null;
@@ -233,17 +323,29 @@ export async function getEmailTransportStatus(): Promise<EmailTransportStatus> {
     }
   }
 
+  const brevoHealth = brevoKey
+    ? await fetchBrevoHealth(brevoKey)
+    : { platformDisabled: false, relayEnabled: null, accountEmail: null, reason: null };
+
+  const brevoActive = Boolean(brevoKey) && !brevoHealth.platformDisabled;
+  const brevoWarning =
+    brevoKey && brevoHealth.platformDisabled
+      ? `Brevo account${brevoHealth.accountEmail ? ` (${brevoHealth.accountEmail})` : ''} is currently disabled by Brevo ("${brevoHealth.reason || 'Your sending platform is currently disabled'}") — Brevo accepts API calls with 201 OK but drops delivery. Reactivate your Brevo transactional account or switch to Gmail SMTP (SMTP_USER + SMTP_PASS App Password).`
+      : null;
+
   const resendSandboxOnly = Boolean(resendKey) && verifiedDomains.length === 0;
   const activeProvider: EmailTransportStatus['activeProvider'] =
     resendKey && verifiedDomains.length > 0
       ? 'resend-verified'
-      : brevoKey
+      : brevoActive
         ? 'brevo'
         : smtp
           ? 'smtp'
-          : resendKey
-            ? 'resend-sandbox'
-            : 'none';
+          : brevoKey && brevoHealth.platformDisabled
+            ? 'brevo-disabled'
+            : resendKey
+              ? 'resend-sandbox'
+              : 'none';
 
   let guidance = '';
   if (activeProvider === 'resend-verified') {
@@ -252,23 +354,27 @@ export async function getEmailTransportStatus(): Promise<EmailTransportStatus> {
     guidance =
       'Brevo HTTPS API active. Works on Railway over port 443 without owning a custom domain.';
   } else if (activeProvider === 'smtp') {
-    guidance = `SMTP transport configured (${smtp?.host}:${smtp?.port}). Note: if Railway trial blocks outbound SMTP ports, use BREVO_API_KEY instead.`;
+    guidance = `SMTP transport configured (${smtp?.host}:${smtp?.port}). Note: if Railway trial blocks outbound SMTP ports, ensure an active HTTPS mail API.`;
+  } else if (activeProvider === 'brevo-disabled') {
+    guidance = brevoWarning!;
   } else if (activeProvider === 'resend-sandbox') {
     guidance =
-      'Resend is in Sandbox mode (onboarding@resend.dev), which only delivers to your own Resend account email. Railway *.up.railway.app domains cannot be verified on Resend — either add BREVO_API_KEY + BREVO_FROM_EMAIL (no domain needed, works over HTTPS on Railway), configure Gmail SMTP (SMTP_USER + SMTP_PASS App Password), or verify a custom domain at resend.com/domains.';
+      'Resend is in Sandbox mode (onboarding@resend.dev), which only delivers to your own Resend account email. Railway *.up.railway.app domains cannot be verified on Resend — either add an active BREVO_API_KEY, configure Gmail SMTP (SMTP_USER + SMTP_PASS App Password), or verify a custom domain at resend.com/domains.';
   } else {
     guidance =
-      'No email provider configured. Set RESEND_API_KEY (with verified custom domain), BREVO_API_KEY + BREVO_FROM_EMAIL (domain-free HTTPS API for Railway), or SMTP_USER + SMTP_PASS.';
+      'No email provider configured. Set RESEND_API_KEY (with verified custom domain), an active BREVO_API_KEY + BREVO_FROM_EMAIL (domain-free HTTPS API for Railway), or SMTP_USER + SMTP_PASS.';
   }
 
   return {
-    configured: activeProvider !== 'none',
+    configured: activeProvider !== 'none' && activeProvider !== 'brevo-disabled',
     activeProvider,
     resendConfigured: Boolean(resendKey),
     resendVerifiedDomains: verifiedDomains,
     resendSandboxOnly,
     resendFromIgnoredWarning: ignoredWarning,
     brevoConfigured: Boolean(brevoKey),
+    brevoPlatformDisabled: brevoHealth.platformDisabled,
+    brevoWarning,
     smtpConfigured: Boolean(smtp),
     smtpHost: smtp?.host ?? null,
     railwayDomainDetected: railwayDomain,
@@ -371,6 +477,13 @@ async function sendViaBrevoApi(params: {
   const apiKey = getBrevoApiKey();
   if (!apiKey) {
     throw new Error('BREVO_API_KEY is not configured.');
+  }
+
+  const health = await fetchBrevoHealth(apiKey);
+  if (health.platformDisabled) {
+    throw new Error(
+      `Brevo transactional sending is disabled on account ${health.accountEmail || 'configured'} ("${health.reason || 'Your sending platform is currently disabled'}"). Brevo silently drops emails until reactivated in your Brevo dashboard (app.brevo.com), or use Gmail SMTP / a verified Resend domain.`
+    );
   }
 
   const rawFrom =

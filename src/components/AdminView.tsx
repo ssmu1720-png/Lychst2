@@ -839,7 +839,9 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
               </div>
               <span
                 className={`font-mono text-[10px] ${
-                  emailStatus?.activeProvider === 'resend-sandbox' || emailStatus?.activeProvider === 'none'
+                  emailStatus?.activeProvider === 'resend-sandbox' ||
+                  emailStatus?.activeProvider === 'brevo-disabled' ||
+                  emailStatus?.activeProvider === 'none'
                     ? 'text-amber-300'
                     : 'text-emerald-400'
                 }`}
@@ -851,7 +853,9 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
             {emailStatus && (
               <div
                 className={`rounded-md border p-3 text-xs space-y-2 ${
-                  emailStatus.activeProvider === 'resend-sandbox' || emailStatus.activeProvider === 'none'
+                  emailStatus.activeProvider === 'resend-sandbox' ||
+                  emailStatus.activeProvider === 'brevo-disabled' ||
+                  emailStatus.activeProvider === 'none'
                     ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
                     : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
                 }`}
