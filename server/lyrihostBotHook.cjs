@@ -404,7 +404,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
   const loaded = origModuleLoad.apply(this, arguments);
   if (
     typeof request === 'string' &&
-    /(^|\/)(@[^/]+\/)?baileys/i.test(request) &&
+    /baileys/i.test(request) &&
     loaded &&
     typeof loaded === 'object'
   ) {
@@ -468,27 +468,48 @@ origProcessOn('uncaughtException', (err) => {
 });
 
 /**
- * 3. Prevent bot web servers from crashing with EADDRINUSE when hardcoding the host platform port (e.g. 3000).
+ * 3. Prevent bot web servers from crashing with EADDRINUSE when hardcoding the host platform port (e.g. 3000) or colliding ports.
  */
 try {
   const net = require('node:net');
   const hostPort = Number.parseInt(process.env.LYRIHOST_HOST_PORT || '', 10);
   const assignedPort = Number.parseInt(process.env.PORT || '', 10);
-  if (
-    Number.isInteger(hostPort) &&
-    hostPort > 0 &&
-    Number.isInteger(assignedPort) &&
-    assignedPort > 0 &&
-    hostPort !== assignedPort &&
-    typeof net.Server.prototype.listen === 'function'
-  ) {
+  const reservedPorts = new Set(
+    [hostPort, 3000, 8000].filter((p) => Number.isInteger(p) && p > 0 && p !== assignedPort)
+  );
+  if (typeof net.Server.prototype.listen === 'function') {
     const origListen = net.Server.prototype.listen;
     net.Server.prototype.listen = function patchedListen(...args) {
-      if (typeof args[0] === 'number' && args[0] === hostPort) {
-        args[0] = assignedPort;
-      } else if (args[0] && typeof args[0] === 'object' && Number(args[0].port) === hostPort) {
-        args[0] = { ...args[0], port: assignedPort };
+      if (Number.isInteger(assignedPort) && assignedPort > 0) {
+        if (typeof args[0] === 'number' && reservedPorts.has(args[0])) {
+          args[0] = assignedPort;
+        } else if (
+          args[0] &&
+          typeof args[0] === 'object' &&
+          reservedPorts.has(Number(args[0].port))
+        ) {
+          args[0] = { ...args[0], port: assignedPort };
+        }
       }
+
+      if (!this.__lyrihostPortGuardAttached) {
+        this.__lyrihostPortGuardAttached = true;
+        const server = this;
+        const onListenError = (err) => {
+          if (err && err.code === 'EADDRINUSE' && !server.__lyrihostRetriedPort) {
+            server.__lyrihostRetriedPort = true;
+            const fallbackPort = Number.isInteger(assignedPort) && assignedPort > 0 ? assignedPort : 0;
+            console.warn(`[runtime] Port already in use; shifting bot HTTP listener to isolated port ${fallbackPort}.`);
+            try {
+              origListen.call(server, fallbackPort);
+            } catch {
+              origListen.call(server, 0);
+            }
+          }
+        };
+        server.prependOnceListener('error', onListenError);
+      }
+
       return origListen.apply(this, args);
     };
   }

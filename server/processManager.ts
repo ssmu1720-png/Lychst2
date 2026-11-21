@@ -10,6 +10,7 @@ export interface BotProcess {
   botId: string;
   numericId?: number;
   startedAt: number;
+  lastOutputAt: number;
   command: string;
   process: ChildProcess;
   logs: string[];
@@ -20,9 +21,12 @@ processEmitter.setMaxListeners(100);
 
 const runningProcesses = new Map<string, BotProcess>();
 const restartingIds = new Set<string>();
+const restartTimers = new Map<string, NodeJS.Timeout>();
 const intentionallyStopped = new Set<string>();
-const crashTimestamps = new Map<string, number[]>();
+const consecutiveFailures = new Map<string, number>();
+const lastOutputAtMap = new Map<string, number>();
 const MAX_LOG_LINES = 500;
+const STABLE_UPTIME_RESET_MS = 45000;
 
 type DbRestartCallback = (botId: string, pid: number) => Promise<void> | void;
 type ProcessExitCallback = (botId: string, code: number | null) => Promise<void> | void;
@@ -58,7 +62,19 @@ export function getProcess(botId: string): BotProcess | undefined {
 }
 
 export function isAutoRestarting(botId: string): boolean {
-  return restartingIds.has(botId);
+  return restartingIds.has(botId) || restartTimers.has(botId);
+}
+
+export function getLastOutputAt(botId: string): number | null {
+  return lastOutputAtMap.get(botId) ?? runningProcesses.get(botId)?.lastOutputAt ?? null;
+}
+
+export function getConsecutiveFailures(botId: string): number {
+  return consecutiveFailures.get(botId) ?? 0;
+}
+
+export function getAssignedBotPort(numericId?: number | null): number {
+  return 10000 + (numericId && numericId > 0 ? numericId : 1);
 }
 
 export function isRunning(botId: string, fallbackPid?: number | null): boolean {
@@ -66,6 +82,17 @@ export function isRunning(botId: string, fallbackPid?: number | null): boolean {
   if (bp && bp.pid > 0) {
     try {
       process.kill(bp.pid, 0);
+      if (process.platform === 'linux' && fs.existsSync(`/proc/${bp.pid}/stat`)) {
+        const stat = fs.readFileSync(`/proc/${bp.pid}/stat`, 'utf-8');
+        const rparen = stat.lastIndexOf(')');
+        if (rparen !== -1) {
+          const stateChar = stat.slice(rparen + 2, rparen + 3);
+          if (stateChar === 'Z') {
+            runningProcesses.delete(botId);
+            return false;
+          }
+        }
+      }
       return true;
     } catch {
       runningProcesses.delete(botId);
@@ -100,6 +127,21 @@ export interface StartProcessOptions {
   restartPolicy?: 'always' | 'on-failure' | 'never';
   memoryLimitMb?: number;
   env?: Record<string, string>;
+}
+
+function clearPendingRestartTimer(botId: string): void {
+  const existing = restartTimers.get(botId);
+  if (existing) {
+    clearTimeout(existing);
+    restartTimers.delete(botId);
+  }
+  restartingIds.delete(botId);
+}
+
+function computeRestartDelayMs(failureCount: number): number {
+  const schedule = [2000, 5000, 12000, 25000, 45000, 60000];
+  const idx = Math.max(0, Math.min(schedule.length - 1, failureCount - 1));
+  return schedule[idx];
 }
 
 function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
@@ -240,7 +282,7 @@ export function startProcess(
   }
 
   intentionallyStopped.delete(botId);
-  restartingIds.delete(botId);
+  clearPendingRestartTimer(botId);
 
   const heapLimitMb = Math.max(512, Math.min(2048, options.memoryLimitMb || 512));
   const hookPath = path.resolve(process.cwd(), 'server', 'lyrihostBotHook.cjs');
@@ -252,7 +294,7 @@ export function startProcess(
   const parentEnv: NodeJS.ProcessEnv = { ...process.env };
   delete parentEnv.PORT;
 
-  const assignedPort = String(10000 + (options.numericId || 1));
+  const assignedPort = String(getAssignedBotPort(options.numericId));
   const child = spawn(trimmedCmd, {
     cwd: botDir,
     env: {
@@ -272,20 +314,26 @@ export function startProcess(
     detached: process.platform !== 'win32',
   });
 
+  const startedAt = Date.now();
   const bp: BotProcess = {
     pid: child.pid ?? 0,
     botId,
     numericId: options.numericId,
-    startedAt: Date.now(),
+    startedAt,
+    lastOutputAt: startedAt,
     command: trimmedCmd,
     process: child,
     logs: [],
   };
 
   runningProcesses.set(botId, bp);
+  lastOutputAtMap.set(botId, startedAt);
 
   const emitOutput = (data: Buffer) => {
     const text = stripAnsi(data.toString());
+    const now = Date.now();
+    bp.lastOutputAt = now;
+    lastOutputAtMap.set(botId, now);
     bp.logs.push(text);
     if (bp.logs.length > MAX_LOG_LINES) {
       bp.logs = bp.logs.slice(-MAX_LOG_LINES);
@@ -301,7 +349,7 @@ export function startProcess(
   child.stderr?.on('data', emitOutput);
 
   const effectivePolicy =
-    options.restartPolicy ?? (options.autoRestart === false ? 'never' : 'on-failure');
+    options.restartPolicy ?? (options.autoRestart === false ? 'never' : 'always');
 
   child.on('exit', (code) => {
     const wasManualStop = intentionallyStopped.has(botId);
@@ -314,8 +362,14 @@ export function startProcess(
     }
 
     if (wasManualStop) {
-      crashTimestamps.delete(botId);
+      consecutiveFailures.delete(botId);
+      clearPendingRestartTimer(botId);
       return;
+    }
+
+    const aliveMs = Date.now() - bp.startedAt;
+    if (aliveMs >= STABLE_UPTIME_RESET_MS) {
+      consecutiveFailures.delete(botId);
     }
 
     const shouldRestart =
@@ -323,16 +377,15 @@ export function startProcess(
       (effectivePolicy === 'on-failure' && code !== 0 && code !== null);
 
     if (shouldRestart) {
-      const now = Date.now();
-      const history = (crashTimestamps.get(botId) ?? []).filter((t) => now - t < 25000);
-      history.push(now);
-      crashTimestamps.set(botId, history);
+      const nextFailures = (consecutiveFailures.get(botId) ?? 0) + 1;
+      consecutiveFailures.set(botId, nextFailures);
 
-      if (history.length >= 4) {
-        crashTimestamps.delete(botId);
+      // For 'on-failure', pause after 6 consecutive rapid crashes; for 'always' (24/7 mode), keep recovering with bounded backoff
+      if (effectivePolicy === 'on-failure' && nextFailures > 6) {
+        consecutiveFailures.delete(botId);
         emitOutput(
           Buffer.from(
-            `\r\n[RUNTIME] Crash loop detected (4 rapid exits in 25s, last exit code ${code ?? 'null'}). Auto-restart paused; inspect logs above.\r\n`
+            `\r\n[RUNTIME] Crash loop detected (${nextFailures - 1} rapid exits, last exit code ${code ?? 'null'}). Auto-restart paused; inspect logs above.\r\n`
           )
         );
         if (_processExitCallback) {
@@ -341,8 +394,16 @@ export function startProcess(
         return;
       }
 
+      const delayMs = computeRestartDelayMs(nextFailures);
+      emitOutput(
+        Buffer.from(
+          `\r\n[SUPERVISOR] Bot exited (code ${code ?? 'null'}) after ${Math.round(aliveMs / 1000)}s. 24/7 recovery scheduled in ${Math.round(delayMs / 1000)}s (attempt #${nextFailures})...\r\n`
+        )
+      );
+
       restartingIds.add(botId);
-      setTimeout(async () => {
+      const timer = setTimeout(async () => {
+        restartTimers.delete(botId);
         restartingIds.delete(botId);
         if (runningProcesses.has(botId) || intentionallyStopped.has(botId)) return;
         try {
@@ -356,10 +417,12 @@ export function startProcess(
             void _processExitCallback(botId, code);
           }
         }
-      }, 3000);
+      }, delayMs);
+      restartTimers.set(botId, timer);
       return;
     }
 
+    consecutiveFailures.delete(botId);
     if (_processExitCallback) {
       void _processExitCallback(botId, code);
     }
@@ -367,7 +430,7 @@ export function startProcess(
 
   child.on('error', (err) => {
     intentionallyStopped.delete(botId);
-    restartingIds.delete(botId);
+    clearPendingRestartTimer(botId);
     emitOutput(Buffer.from(`\r\n[ERROR] ${err.message}\r\n`));
     runningProcesses.delete(botId);
     processEmitter.emit(`exit:${botId}`, 1);
@@ -384,7 +447,8 @@ export function startProcess(
 
 export function stopProcess(botId: string): boolean {
   intentionallyStopped.add(botId);
-  restartingIds.delete(botId);
+  clearPendingRestartTimer(botId);
+  consecutiveFailures.delete(botId);
 
   const bp = runningProcesses.get(botId);
   if (!bp) return false;
@@ -471,5 +535,101 @@ function parsePsOutput(output: string): { cpuPercent: number; memoryMb: number }
   return {
     cpuPercent: Number(totalCpu.toFixed(1)),
     memoryMb: Math.round(totalRssKb / 1024),
+  };
+}
+
+export interface BotProbeResult {
+  botId: string;
+  processAlive: boolean;
+  pid: number | null;
+  osState: string | null;
+  autoRestarting: boolean;
+  consecutiveFailures: number;
+  uptimeMs: number;
+  lastOutputAt: string | null;
+  cpuPercent: number;
+  memoryMb: number;
+  httpProbe: {
+    checkedPort: number;
+    listening: boolean;
+    statusCode: number | null;
+    latencyMs: number | null;
+  };
+  responsive: boolean;
+}
+
+export async function probeBotProcessHealth(params: {
+  botId: string;
+  numericId?: number | null;
+  fallbackPid?: number | null;
+  customPort?: number | null;
+  healthCheckPath?: string;
+}): Promise<BotProbeResult> {
+  const bp = runningProcesses.get(params.botId);
+  const alive = isRunning(params.botId, params.fallbackPid);
+  const activePid = bp?.pid ?? params.fallbackPid ?? null;
+  let osState: string | null = null;
+
+  if (alive && activePid && process.platform === 'linux' && fs.existsSync(`/proc/${activePid}/stat`)) {
+    try {
+      const stat = fs.readFileSync(`/proc/${activePid}/stat`, 'utf-8');
+      const rparen = stat.lastIndexOf(')');
+      if (rparen !== -1) {
+        osState = stat.slice(rparen + 2, rparen + 3) || null;
+      }
+    } catch {
+      osState = null;
+    }
+  }
+
+  const stats = alive && activePid ? await sampleProcessStats(activePid) : null;
+  const candidatePort =
+    params.customPort && params.customPort > 0 && params.customPort <= 65535
+      ? params.customPort
+      : getAssignedBotPort(params.numericId);
+
+  const rawPath = (params.healthCheckPath || '/health').trim();
+  const healthPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+
+  let listening = false;
+  let statusCode: number | null = null;
+  let httpLatencyMs: number | null = null;
+
+  if (alive && candidatePort > 0) {
+    const start = performance.now();
+    try {
+      const resp = await fetch(`http://127.0.0.1:${candidatePort}${healthPath}`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(800),
+      });
+      listening = true;
+      statusCode = resp.status;
+      httpLatencyMs = Math.max(1, Math.round(performance.now() - start));
+    } catch {
+      listening = false;
+    }
+  }
+
+  const lastOut = getLastOutputAt(params.botId);
+  const uptimeMs = bp && alive ? Math.max(0, Date.now() - bp.startedAt) : 0;
+
+  return {
+    botId: params.botId,
+    processAlive: alive,
+    pid: alive ? activePid : null,
+    osState,
+    autoRestarting: isAutoRestarting(params.botId),
+    consecutiveFailures: getConsecutiveFailures(params.botId),
+    uptimeMs,
+    lastOutputAt: lastOut ? new Date(lastOut).toISOString() : null,
+    cpuPercent: stats?.cpuPercent ?? 0,
+    memoryMb: stats?.memoryMb ?? 0,
+    httpProbe: {
+      checkedPort: candidatePort,
+      listening,
+      statusCode,
+      latencyMs: httpLatencyMs,
+    },
+    responsive: alive && osState !== 'Z',
   };
 }

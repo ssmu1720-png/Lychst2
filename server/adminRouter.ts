@@ -19,7 +19,7 @@ import {
   toggleCouponActive,
   updateTicketReply,
 } from './db.ts';
-import { sendBrandedNotificationEmail } from './emailService.ts';
+import { getEmailTransportStatus, sendBrandedNotificationEmail } from './emailService.ts';
 import type {
   BotDeployment,
   BotPlatform,
@@ -179,6 +179,37 @@ export function createAdminRouter(getDeployments: () => BotDeployment[]): IRoute
         error: err instanceof Error ? err.message : 'Unable to update support ticket.',
       });
     }
+  });
+
+  router.get('/email-status', async (_req: AuthenticatedRequest, res) => {
+    const status = await getEmailTransportStatus();
+    res.json(status);
+  });
+
+  router.post('/email-test', async (req: AuthenticatedRequest, res) => {
+    const body = (req.body ?? {}) as { toEmail?: string };
+    const targetEmail = (body.toEmail || req.authUser?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(targetEmail)) {
+      res.status(400).json({ error: 'Valid recipient email address is required.' });
+      return;
+    }
+    const status = await getEmailTransportStatus();
+    const result = await sendBrandedNotificationEmail({
+      toEmail: targetEmail,
+      badge: 'LYRIHOST MAIL DIAGNOSTIC',
+      subject: 'Lyrihost Mail Delivery Verification',
+      heading: 'Transactional Email Delivery Working',
+      bodyText: `This test message confirms your Lyrihost mail transport is delivering OTP and notification emails.\n\nActive provider: ${status.activeProvider}`,
+    });
+    if (!result.ok) {
+      res.status(422).json({
+        ok: false,
+        error: result.error || 'Email test failed.',
+        status,
+      });
+      return;
+    }
+    res.json({ ok: true, id: result.id, toEmail: targetEmail, status });
   });
 
   router.get('/emails', (_req: AuthenticatedRequest, res) => {

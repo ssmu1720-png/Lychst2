@@ -7,6 +7,7 @@ import {
   getLogs,
   isAutoRestarting,
   isRunning,
+  probeBotProcessHealth,
   safeRemoveDir,
   sendInput,
   startProcess,
@@ -124,8 +125,14 @@ export function createBotsRouter(
 
     let changed = false;
     for (const dep of state.deployments) {
-      if (!isRunning(dep.id, dep.pid) && (dep.status === 'online' || dep.status === 'building')) {
+      if (
+        !isRunning(dep.id, dep.pid) &&
+        !isAutoRestarting(dep.id) &&
+        dep.status === 'online' &&
+        dep.settings.restartPolicy === 'never'
+      ) {
         dep.status = 'stopped';
+        dep.desiredRunning = false;
         dep.pid = null;
         changed = true;
       }
@@ -245,8 +252,14 @@ export function createBotsRouter(
       res.status(404).json({ error: 'Bot not found' });
       return;
     }
-    if (!isRunning(dep.id, dep.pid) && (dep.status === 'online' || dep.status === 'building')) {
+    if (
+      !isRunning(dep.id, dep.pid) &&
+      !isAutoRestarting(dep.id) &&
+      dep.status === 'online' &&
+      dep.settings.restartPolicy === 'never'
+    ) {
       dep.status = 'stopped';
+      dep.desiredRunning = false;
       dep.pid = null;
       saveState();
     }
@@ -357,16 +370,19 @@ export function createBotsRouter(
       const stability = await waitForProcessStability(dep.id, 1000);
       if (stability.alive) {
         dep.status = 'online';
+        dep.desiredRunning = true;
         dep.pid = bp.pid;
         dep.uptimeSeconds = 1;
         dep.lastDeployedAt = nowIso();
         pushDeploymentLog(dep, 'success', 'runtime', `Started process (PID ${bp.pid}): ${resolved.startCommand}`);
       } else if (isAutoRestarting(dep.id)) {
         dep.status = 'building';
+        dep.desiredRunning = true;
         dep.pid = null;
         pushDeploymentLog(dep, 'warn', 'runtime', `Process exited right after start (code ${stability.exitCode ?? 'null'}); auto-restart scheduled.`);
       } else {
         dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+        dep.desiredRunning = false;
         dep.pid = null;
         pushDeploymentLog(dep, dep.status === 'failed' ? 'error' : 'warn', 'runtime', `Process exited with code ${stability.exitCode ?? 'null'}.`);
       }
@@ -392,6 +408,7 @@ export function createBotsRouter(
     }
     stopProcess(dep.id);
     dep.status = 'stopped';
+    dep.desiredRunning = false;
     dep.pid = null;
     dep.cpuPercent = 0;
     dep.memoryMb = 0;
@@ -433,15 +450,18 @@ export function createBotsRouter(
       const stability = await waitForProcessStability(dep.id, 1000);
       if (stability.alive) {
         dep.status = 'online';
+        dep.desiredRunning = true;
         dep.pid = bp.pid;
         dep.uptimeSeconds = 1;
         pushDeploymentLog(dep, 'info', 'runtime', `Restarted process (PID ${bp.pid})`);
       } else if (isAutoRestarting(dep.id)) {
         dep.status = 'building';
+        dep.desiredRunning = true;
         dep.pid = null;
         pushDeploymentLog(dep, 'warn', 'runtime', `Restart exited (code ${stability.exitCode ?? 'null'}); auto-restart scheduled.`);
       } else {
         dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+        dep.desiredRunning = false;
         dep.pid = null;
         pushDeploymentLog(dep, dep.status === 'failed' ? 'error' : 'warn', 'runtime', `Restart exited with code ${stability.exitCode ?? 'null'}.`);
       }
@@ -544,6 +564,32 @@ export function createBotsRouter(
     const live = getLogs(dep.id);
     const logs = live || dep.logs.map((l) => `[${l.timestamp}] [${l.stage.toUpperCase()}] ${l.message}`).join('\n');
     res.json({ logs });
+  });
+
+  // Live responsiveness & OS/HTTP probe for bot
+  router.get('/bots/:id/probe', async (req, res) => {
+    const state = getState();
+    const dep = findDeploymentByParam(state, req.params.id);
+    if (!dep) {
+      res.status(404).json({ error: 'Bot not found' });
+      return;
+    }
+    const portEntry = dep.settings.envVars.find((v) => v.key === 'PORT' || v.key === 'WEB_PORT');
+    const customPort = portEntry ? Number.parseInt(portEntry.value.trim(), 10) : null;
+    const probe = await probeBotProcessHealth({
+      botId: dep.id,
+      numericId: dep.numericId,
+      fallbackPid: dep.pid,
+      customPort: Number.isInteger(customPort) ? customPort : null,
+      healthCheckPath: dep.settings.healthCheckPath,
+    });
+    res.json({
+      ...probe,
+      status: dep.status,
+      desiredRunning: Boolean(dep.desiredRunning),
+      restartPolicy: dep.settings.restartPolicy,
+      is24x7Protected: Boolean(dep.desiredRunning && dep.settings.restartPolicy !== 'never'),
+    });
   });
 
   return router;

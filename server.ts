@@ -38,11 +38,13 @@ import {
 } from './server/gitRunner.ts';
 import {
   ensureBotsDir,
+  getAssignedBotPort,
   getBotDir,
   getProcess,
   isAutoRestarting,
   isRunning,
   killAllOrphanedBotProcesses,
+  probeBotProcessHealth,
   processEmitter,
   safeRemoveDir,
   sampleProcessStats,
@@ -54,6 +56,7 @@ import {
   stopProcess,
   waitForProcessStability,
 } from './server/processManager.ts';
+import { getEmailTransportStatus } from './server/emailService.ts';
 import { TEMPLATE_BOTS } from './src/catalog/templateBots.ts';
 import {
   buildEmptyTelemetryHistory,
@@ -148,6 +151,7 @@ setDbRestartCallback((botId, pid) => {
   const target = state.deployments.find((d) => d.id === botId);
   if (!target) return;
   target.status = 'online';
+  target.desiredRunning = true;
   target.pid = pid;
   target.uptimeSeconds = 1;
   pushDeploymentLog(target, 'info', 'runtime', `Auto-restarted bot process (PID ${pid}).`);
@@ -159,6 +163,9 @@ setProcessExitCallback((botId, code) => {
   const target = state.deployments.find((d) => d.id === botId);
   if (!target) return;
   target.status = code === 0 || code === null ? 'stopped' : 'failed';
+  if (target.settings.restartPolicy === 'never') {
+    target.desiredRunning = false;
+  }
   target.pid = null;
   target.cpuPercent = 0;
   target.memoryMb = 0;
@@ -175,15 +182,77 @@ setProcessExitCallback((botId, code) => {
   broadcastDeployments();
 });
 
+const watchdogLastAttempt = new Map<string, number>();
+
+async function recoverBotProcess(dep: BotDeployment): Promise<void> {
+  const now = Date.now();
+  const last = watchdogLastAttempt.get(dep.id) ?? 0;
+  if (now - last < 10000) return;
+  watchdogLastAttempt.set(dep.id, now);
+
+  if (isRunning(dep.id, dep.pid) || isAutoRestarting(dep.id) || pipelineAborts.has(dep.id)) {
+    return;
+  }
+
+  const botDir = getBotDir(dep.id);
+  const hasNodeModulesOrPy =
+    fs.existsSync(botDir) &&
+    (!fs.existsSync(path.join(botDir, 'package.json')) || fs.existsSync(path.join(botDir, 'node_modules')));
+
+  if (!fs.existsSync(botDir) || !hasNodeModulesOrPy) {
+    pushDeploymentLog(dep, 'warn', 'runtime', '24/7 Watchdog rebuilding missing workspace...');
+    saveState();
+    broadcastDeployments();
+    void triggerDeploymentPipeline(dep);
+    return;
+  }
+
+  try {
+    writeDotEnvFile(botDir, dep.settings.envVars);
+    const resolved = resolveDeploymentCommands(botDir, dep.settings);
+    dep.settings.startCommand = resolved.startCommand;
+    const bp = startProcess(dep.id, resolved.startCommand, {
+      numericId: dep.numericId,
+      restartPolicy: dep.settings.restartPolicy,
+      memoryLimitMb: dep.memoryLimitMb,
+      env: buildEnvMap(dep.settings.envVars),
+    });
+    const stability = await waitForProcessStability(dep.id, 1000);
+    if (stability.alive) {
+      dep.status = 'online';
+      dep.desiredRunning = true;
+      dep.pid = bp.pid;
+      dep.uptimeSeconds = 1;
+      pushDeploymentLog(dep, 'success', 'runtime', `24/7 Watchdog recovered bot process (PID ${bp.pid}).`);
+      saveState();
+      broadcastDeployments();
+    }
+  } catch (err) {
+    pushDeploymentLog(
+      dep,
+      'error',
+      'runtime',
+      `24/7 Watchdog recovery attempt failed: ${err instanceof Error ? err.message : 'Unknown error'}`
+    );
+    saveState();
+    broadcastDeployments();
+  }
+}
+
 async function measureBotProbeLatency(dep: BotDeployment, statsStartMs: number): Promise<number> {
   const portEntry = dep.settings.envVars.find((v) => v.key === 'PORT' || v.key === 'WEB_PORT');
-  const rawPort = portEntry ? Number.parseInt(portEntry.value.trim(), 10) : Number.NaN;
-  if (Number.isInteger(rawPort) && rawPort > 0 && rawPort <= 65535 && rawPort !== PORT) {
+  const envPort = portEntry ? Number.parseInt(portEntry.value.trim(), 10) : Number.NaN;
+  const candidatePort =
+    Number.isInteger(envPort) && envPort > 0 && envPort <= 65535 && envPort !== PORT
+      ? envPort
+      : getAssignedBotPort(dep.numericId);
+
+  if (candidatePort > 0 && candidatePort <= 65535 && candidatePort !== PORT) {
     const rawPath = (dep.settings.healthCheckPath || '/health').trim();
     const healthPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
     const probeStart = performance.now();
     try {
-      await fetch(`http://127.0.0.1:${rawPort}${healthPath}`, {
+      await fetch(`http://127.0.0.1:${candidatePort}${healthPath}`, {
         method: 'GET',
         signal: AbortSignal.timeout(400),
       });
@@ -232,11 +301,13 @@ setInterval(() => {
     let changed = false;
 
     for (const dep of state.deployments) {
+      const expired = Boolean(dep.expiresAt && Date.parse(dep.expiresAt) <= Date.now());
       if (dep.status === 'online') {
-        if (dep.expiresAt && Date.parse(dep.expiresAt) <= Date.now()) {
+        if (expired) {
           abortPipeline(dep.id);
           stopProcess(dep.id);
           dep.status = 'stopped';
+          dep.desiredRunning = false;
           dep.pid = null;
           dep.cpuPercent = 0;
           dep.memoryMb = 0;
@@ -256,7 +327,13 @@ setInterval(() => {
           continue;
         }
         if (!isRunning(dep.id, dep.pid)) {
+          if (dep.desiredRunning !== false && dep.settings.restartPolicy !== 'never') {
+            dep.pid = null;
+            void recoverBotProcess(dep);
+            continue;
+          }
           dep.status = 'stopped';
+          dep.desiredRunning = false;
           dep.pid = null;
           dep.cpuPercent = 0;
           dep.memoryMb = 0;
@@ -299,6 +376,18 @@ setInterval(() => {
           }
           continue;
         }
+      }
+
+      if (
+        !expired &&
+        dep.desiredRunning === true &&
+        dep.settings.restartPolicy === 'always' &&
+        (dep.status === 'stopped' || dep.status === 'failed') &&
+        !isRunning(dep.id, dep.pid) &&
+        !isAutoRestarting(dep.id) &&
+        !pipelineAborts.has(dep.id)
+      ) {
+        void recoverBotProcess(dep);
       }
 
       if (dep.status === 'failed') {
@@ -1079,12 +1168,14 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
 
     if (stability.alive) {
       dep.status = 'online';
+      dep.desiredRunning = true;
       dep.pid = bp.pid;
       dep.lastDeployedAt = nowIso();
       dep.uptimeSeconds = 1;
       appendLog(dep, 'success', 'runtime', `Bot process online (PID ${bp.pid}): ${startCmd}`);
     } else if (isAutoRestarting(dep.id)) {
       dep.status = 'building';
+      dep.desiredRunning = true;
       dep.pid = null;
       appendLog(
         dep,
@@ -1094,6 +1185,7 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       );
     } else {
       dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+      dep.desiredRunning = false;
       dep.pid = null;
       appendLog(
         dep,
@@ -1127,9 +1219,9 @@ async function startupBotRestore(): Promise<void> {
 
     const resumeIds = new Set<string>();
     for (const dep of state.deployments) {
-      const wasOnline = dep.status === 'online';
+      const wasActive = dep.status === 'online' || dep.desiredRunning === true;
       const notExpired = !dep.expiresAt || Date.parse(dep.expiresAt) > Date.now();
-      if (wasOnline && notExpired && dep.settings.restartPolicy !== 'never') {
+      if (wasActive && notExpired && dep.settings.restartPolicy !== 'never') {
         resumeIds.add(dep.id);
       }
       if (dep.status === 'building' || dep.status === 'scanning' || (dep.status === 'online' && !isRunning(dep.id, dep.pid))) {
@@ -1144,13 +1236,22 @@ async function startupBotRestore(): Promise<void> {
 
     for (const dep of state.deployments) {
       const botDir = getBotDir(dep.id);
-      if (!fs.existsSync(botDir)) {
+      const needsClone = !fs.existsSync(botDir);
+      const needsNodeInstall =
+        fs.existsSync(botDir) &&
+        fs.existsSync(path.join(botDir, 'package.json')) &&
+        !fs.existsSync(path.join(botDir, 'node_modules'));
+
+      if (needsClone) {
         const token = dep.gitToken || state.githubToken || process.env.GITHUB_TOKEN || undefined;
         const cloneRes = await cloneRepository(dep.repoUrl, botDir, {
           branch: dep.settings.branch,
           gitToken: token,
         });
         if (cloneRes.ok) {
+          if (dep.platform === 'whatsapp') {
+            fs.mkdirSync(path.join(botDir, 'session'), { recursive: true });
+          }
           writeDotEnvFile(botDir, dep.settings.envVars);
           const resolved = resolveDeploymentCommands(botDir, dep.settings);
           dep.settings.installCommand = resolved.installCommand;
@@ -1163,6 +1264,14 @@ async function startupBotRestore(): Promise<void> {
           if (resolved.buildCommand) {
             await runShellStep(resolved.buildCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
           }
+        }
+      } else if (needsNodeInstall && resumeIds.has(dep.id)) {
+        const resolved = resolveDeploymentCommands(botDir, dep.settings);
+        if (resolved.installCommand) {
+          await runShellStep(resolved.installCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
+        }
+        if (resolved.buildCommand) {
+          await runShellStep(resolved.buildCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
         }
       }
 
@@ -1179,6 +1288,7 @@ async function startupBotRestore(): Promise<void> {
           const stability = await waitForProcessStability(dep.id, 1000);
           if (stability.alive) {
             dep.status = 'online';
+            dep.desiredRunning = true;
             dep.pid = bp.pid;
             dep.uptimeSeconds = 1;
             pushDeploymentLog(dep, 'info', 'runtime', `Restored and started bot process after server boot (PID ${bp.pid}).`);
@@ -1222,9 +1332,24 @@ async function startServer() {
     )
   );
 
-  // Health endpoint
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'lyrihost', timestamp: nowIso() });
+  // Health endpoint (also surfaces safe mail transport status & active bot count)
+  app.get('/api/health', async (_req, res) => {
+    const emailStatus = await getEmailTransportStatus().catch(() => null);
+    res.json({
+      ok: true,
+      service: 'lyrihost',
+      timestamp: nowIso(),
+      uptimeSeconds: Math.round(process.uptime()),
+      onlineBots: state.deployments.filter((d) => d.status === 'online').length,
+      totalBots: state.deployments.length,
+      email: emailStatus
+        ? {
+            configured: emailStatus.configured,
+            activeProvider: emailStatus.activeProvider,
+            resendSandboxOnly: emailStatus.resendSandboxOnly,
+          }
+        : null,
+    });
   });
 
   // Curated + Admin-added WhatsApp & Multi-Device Bot Templates
@@ -1487,6 +1612,7 @@ async function startServer() {
       platform: platform || 'custom',
       framework: framework || 'Custom Bot',
       status: 'building',
+      desiredRunning: true,
       commitSha: commitSha || 'head',
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -1731,6 +1857,7 @@ async function startServer() {
       abortPipeline(dep.id);
       stopProcess(dep.id);
       dep.status = 'stopped';
+      dep.desiredRunning = false;
       dep.pid = null;
       dep.cpuPercent = 0;
       dep.memoryMb = 0;
@@ -1746,6 +1873,7 @@ async function startServer() {
         });
         return;
       }
+      dep.desiredRunning = true;
       const botDir = getBotDir(dep.id);
       const hasNodeModulesOrPy =
         fs.existsSync(botDir) &&
@@ -1766,6 +1894,7 @@ async function startServer() {
           const stability = await waitForProcessStability(dep.id, 1000);
           if (stability.alive) {
             dep.status = 'online';
+            dep.desiredRunning = true;
             dep.pid = bp.pid;
             dep.uptimeSeconds = 1;
             appendLog(
@@ -1776,6 +1905,7 @@ async function startServer() {
             );
           } else if (isAutoRestarting(dep.id)) {
             dep.status = 'building';
+            dep.desiredRunning = true;
             dep.pid = null;
             appendLog(
               dep,
@@ -1785,6 +1915,7 @@ async function startServer() {
             );
           } else {
             dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+            dep.desiredRunning = false;
             dep.pid = null;
             appendLog(
               dep,
@@ -1810,6 +1941,7 @@ async function startServer() {
         });
         return;
       }
+      dep.desiredRunning = true;
       if (action === 'redeploy') {
         void triggerDeploymentPipeline(dep);
       } else {
@@ -1836,11 +1968,13 @@ async function startServer() {
             const stability = await waitForProcessStability(dep.id, 1000);
             if (stability.alive) {
               dep.status = 'online';
+              dep.desiredRunning = true;
               dep.pid = bp.pid;
               dep.uptimeSeconds = 1;
               appendLog(dep, 'info', 'runtime', `Restarted bot process (PID ${bp.pid}).`);
             } else if (isAutoRestarting(dep.id)) {
               dep.status = 'building';
+              dep.desiredRunning = true;
               dep.pid = null;
               appendLog(
                 dep,
@@ -1850,6 +1984,7 @@ async function startServer() {
               );
             } else {
               dep.status = stability.exitCode === 0 || stability.exitCode === null ? 'stopped' : 'failed';
+              dep.desiredRunning = false;
               dep.pid = null;
               appendLog(
                 dep,
@@ -1877,6 +2012,31 @@ async function startServer() {
     saveState();
     broadcastDeployments();
     res.json(dep);
+  });
+
+  // Live responsiveness & OS/HTTP probe for deployment
+  app.get('/api/deployments/:id/probe', async (req, res) => {
+    const dep = state.deployments.find((d) => d.id === req.params.id);
+    if (!dep || !canManageDeployment(req, dep)) {
+      res.status(404).json({ error: 'Deployment not found.' });
+      return;
+    }
+    const portEntry = dep.settings.envVars.find((v) => v.key === 'PORT' || v.key === 'WEB_PORT');
+    const customPort = portEntry ? Number.parseInt(portEntry.value.trim(), 10) : null;
+    const probe = await probeBotProcessHealth({
+      botId: dep.id,
+      numericId: dep.numericId,
+      fallbackPid: dep.pid,
+      customPort: Number.isInteger(customPort) ? customPort : null,
+      healthCheckPath: dep.settings.healthCheckPath,
+    });
+    res.json({
+      ...probe,
+      status: dep.status,
+      desiredRunning: Boolean(dep.desiredRunning),
+      restartPolicy: dep.settings.restartPolicy,
+      is24x7Protected: Boolean(dep.desiredRunning && dep.settings.restartPolicy !== 'never'),
+    });
   });
 
   // Delete deployment and clean up cloned directory
@@ -1984,6 +2144,22 @@ async function startServer() {
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Lyrihost server listening on http://0.0.0.0:${PORT}`);
     void startupBotRestore();
+
+    // Production 24/7 HTTP ingress self-keepalive (prevents PaaS idle sleep when external URL env is set)
+    const rawExternal =
+      process.env.APP_URL?.trim() ||
+      process.env.RENDER_EXTERNAL_URL?.trim() ||
+      (process.env.RAILWAY_PUBLIC_DOMAIN?.trim()
+        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim().replace(/^https?:\/\//i, '')}`
+        : '');
+    if (rawExternal && /^https?:\/\//i.test(rawExternal)) {
+      const keepaliveUrl = `${rawExternal.replace(/\/+$/, '')}/api/health`;
+      setInterval(() => {
+        if (state.deployments.some((d) => d.status === 'online' || d.desiredRunning)) {
+          fetch(keepaliveUrl, { method: 'GET', signal: AbortSignal.timeout(5000) }).catch(() => {});
+        }
+      }, 4 * 60 * 1000).unref();
+    }
   });
 }
 

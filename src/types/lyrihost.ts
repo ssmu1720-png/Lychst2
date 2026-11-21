@@ -190,6 +190,7 @@ export interface BotDeployment {
   platform: BotPlatform;
   framework: string;
   status: DeploymentStatus;
+  desiredRunning?: boolean;
   commitSha: string;
   createdAt: string;
   updatedAt: string;

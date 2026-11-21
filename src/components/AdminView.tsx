@@ -52,6 +52,17 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
   const [coupons, setCoupons] = useState<CouponRecord[]>([]);
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [campaigns, setCampaigns] = useState<EmailCampaign[]>([]);
+  const [emailStatus, setEmailStatus] = useState<{
+    configured: boolean;
+    activeProvider: string;
+    resendSandboxOnly: boolean;
+    resendFromIgnoredWarning: string | null;
+    brevoConfigured: boolean;
+    smtpConfigured: boolean;
+    guidance: string;
+  } | null>(null);
+  const [testingEmail, setTestingEmail] = useState(false);
+  const [testRecipientEmail, setTestRecipientEmail] = useState('');
   const [deployments, setDeployments] = useState<BotDeployment[]>([]);
   const [customTemplates, setCustomTemplates] = useState<TemplateBotSpec[]>([]);
 
@@ -108,12 +119,13 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
   const loadAllAdmin = useCallback(async () => {
     setLoading(true);
     try {
-      const [ovRes, usrRes, cpnRes, tktRes, emlRes, depRes, tplRes] = await Promise.all([
+      const [ovRes, usrRes, cpnRes, tktRes, emlRes, emlStatusRes, depRes, tplRes] = await Promise.all([
         fetch('/api/admin/overview', { headers: { Authorization: `Bearer ${authToken}` } }),
         fetch('/api/admin/users', { headers: { Authorization: `Bearer ${authToken}` } }),
         fetch('/api/admin/coupons', { headers: { Authorization: `Bearer ${authToken}` } }),
         fetch('/api/admin/tickets', { headers: { Authorization: `Bearer ${authToken}` } }),
         fetch('/api/admin/emails', { headers: { Authorization: `Bearer ${authToken}` } }),
+        fetch('/api/admin/email-status', { headers: { Authorization: `Bearer ${authToken}` } }),
         fetch('/api/admin/deployments', { headers: { Authorization: `Bearer ${authToken}` } }),
         fetch('/api/admin/templates', { headers: { Authorization: `Bearer ${authToken}` } }),
       ]);
@@ -140,6 +152,10 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
       if (emlRes.ok) {
         const d = (await emlRes.json()) as { campaigns: EmailCampaign[] };
         setCampaigns(d.campaigns);
+      }
+      if (emlStatusRes.ok) {
+        const d = (await emlStatusRes.json()) as NonNullable<typeof emailStatus>;
+        setEmailStatus(d);
       }
       if (depRes.ok) {
         const d = (await depRes.json()) as { deployments: BotDeployment[] };
@@ -814,15 +830,88 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
       {tab === 'emails' && (
         <section className="grid grid-cols-1 gap-5 lg:grid-cols-12">
           <div className="atelier-panel rounded-lg border border-red-950/90 p-5 space-y-4 lg:col-span-7">
-            <div className="flex items-center justify-between border-b border-red-950/70 pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-red-950/70 pb-3">
               <div className="flex items-center gap-2">
                 <Mail className="h-4 w-4 text-red-400" />
                 <h2 className="font-display text-xl font-semibold text-slate-50">
                   Send Promotional / Update Email
                 </h2>
               </div>
-              <span className="font-mono text-[10px] text-emerald-400">Resend API Active</span>
+              <span
+                className={`font-mono text-[10px] ${
+                  emailStatus?.activeProvider === 'resend-sandbox' || emailStatus?.activeProvider === 'none'
+                    ? 'text-amber-300'
+                    : 'text-emerald-400'
+                }`}
+              >
+                {emailStatus ? `Transport: ${emailStatus.activeProvider}` : 'Checking Mail Transport...'}
+              </span>
             </div>
+
+            {emailStatus && (
+              <div
+                className={`rounded-md border p-3 text-xs space-y-2 ${
+                  emailStatus.activeProvider === 'resend-sandbox' || emailStatus.activeProvider === 'none'
+                    ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                    : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
+                }`}
+              >
+                <div className="leading-relaxed">{emailStatus.guidance}</div>
+                {emailStatus.resendFromIgnoredWarning && (
+                  <div className="font-mono text-[11px] text-amber-300">
+                    {emailStatus.resendFromIgnoredWarning}
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <input
+                    type="email"
+                    value={testRecipientEmail}
+                    onChange={(e) => setTestRecipientEmail(e.target.value)}
+                    placeholder="Test recipient (e.g. ssmu1720@gmail.com)"
+                    className="min-w-[210px] flex-1 rounded border border-red-950/90 bg-[#080305] px-2.5 py-1.5 font-mono text-[11px] text-slate-100 placeholder:text-slate-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={testingEmail}
+                    onClick={async () => {
+                      setTestingEmail(true);
+                      setFeedback(null);
+                      try {
+                        const resp = await fetch('/api/admin/email-test', {
+                          method: 'POST',
+                          headers,
+                          body: JSON.stringify({ toEmail: testRecipientEmail.trim() || undefined }),
+                        });
+                        const data = (await resp.json()) as {
+                          ok?: boolean;
+                          toEmail?: string;
+                          error?: string;
+                          status?: NonNullable<typeof emailStatus>;
+                        };
+                        if (data.status) setEmailStatus(data.status);
+                        if (!resp.ok || !data.ok) {
+                          throw new Error(data.error || 'Email delivery test failed.');
+                        }
+                        setFeedback({
+                          type: 'success',
+                          text: `Test email delivered to ${data.toEmail} via ${data.status?.activeProvider || 'active transport'}.`,
+                        });
+                      } catch (err) {
+                        setFeedback({
+                          type: 'error',
+                          text: err instanceof Error ? err.message : 'Test email failed.',
+                        });
+                      } finally {
+                        setTestingEmail(false);
+                      }
+                    }}
+                    className="rounded border border-red-500/40 bg-red-600/20 px-3 py-1.5 text-[11px] font-semibold text-rose-200 hover:bg-red-600/35 disabled:opacity-60 whitespace-nowrap"
+                  >
+                    {testingEmail ? 'Testing...' : 'Send Test Email'}
+                  </button>
+                </div>
+              </div>
+            )}
 
             <form onSubmit={handleSendCampaign} className="space-y-3.5">
               <div>
