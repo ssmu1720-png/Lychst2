@@ -94,7 +94,7 @@ async function fetchBrevoHealth(apiKey: string): Promise<{
           typeof e.reason === 'string' &&
           /sending platform is currently disabled|account.*disabled|suspended/i.test(e.reason)
       );
-      if (disabledEvent) {
+      if (disabledEvent && relayEnabled !== true) {
         platformDisabled = true;
         reason = disabledEvent.reason || 'Brevo sending platform is currently disabled.';
       }
