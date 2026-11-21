@@ -490,7 +490,7 @@ async function sendViaBrevoApi(params: {
     process.env.BREVO_FROM_EMAIL?.trim() ||
     process.env.MAIL_FROM_EMAIL?.trim() ||
     process.env.SMTP_USER?.trim() ||
-    'Lyrihost <sharksam004@gmail.com>';
+    (health.accountEmail ? `Lyrihost <${health.accountEmail}>` : 'Lyrihost <ssmu1720@gmail.com>');
 
   const sender = parseFromHeader(rawFrom);
   const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
