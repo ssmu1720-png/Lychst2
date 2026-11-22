@@ -147,14 +147,12 @@ function logTransientNotice(err) {
   console.warn(`[runtime] Suppressed transient WhatsApp socket retry (${code ? `${code} ` : ''}${msg}).`);
 }
 
-let cachedWaVersion = [2, 3000, 1055718978];
+let cachedWaVersion = [2, 3000, 1055794947];
 let versionRefreshStarted = false;
-let swRefreshStarted = false;
+let swRefreshTimerStarted = false;
 let loggedVersionUpgrade = false;
 
 function refreshWaVersionFromWhatsAppWeb() {
-  if (swRefreshStarted) return;
-  swRefreshStarted = true;
   try {
     const https = require('node:https');
     const req = https.get(
@@ -200,6 +198,11 @@ function refreshWaVersionFromWhatsAppWeb() {
 }
 
 refreshWaVersionFromWhatsAppWeb();
+if (!swRefreshTimerStarted) {
+  swRefreshTimerStarted = true;
+  const swRefreshTimer = setInterval(refreshWaVersionFromWhatsAppWeb, 6 * 60 * 60 * 1000);
+  if (typeof swRefreshTimer.unref === 'function') swRefreshTimer.unref();
+}
 
 function refreshWaVersionFromModule(loaded) {
   if (versionRefreshStarted || !loaded || typeof loaded !== 'object') return;
@@ -293,51 +296,73 @@ function syncSocketUserJid(sock) {
   }
 }
 
+const normalizedMessageSet = new WeakSet();
+const loggedIncomingKeys = new Set();
+
+function recordIncomingLogOnce(keyId) {
+  if (!keyId) return true;
+  if (loggedIncomingKeys.has(keyId)) return false;
+  loggedIncomingKeys.add(keyId);
+  if (loggedIncomingKeys.size > 500) {
+    const oldest = loggedIncomingKeys.values().next().value;
+    if (oldest !== undefined) loggedIncomingKeys.delete(oldest);
+  }
+  return true;
+}
+
 function normalizeIncomingChatUpdate(sock, chatUpdate) {
   if (!chatUpdate || !Array.isArray(chatUpdate.messages)) return [chatUpdate];
   syncSocketUserJid(sock);
 
   const ownBarePhoneJid = sock && sock.user && sock.user.id ? toBareJid(sock.user.id) : null;
   const ownBareLid = sock && sock.user && sock.user.lid ? toBareJid(sock.user.lid) : null;
+  // Baileys v7+ exposes signalRepository.lidMapping and requires msg.key.remoteJid to keep @lid addressing intact
+  const supportsNativeLid = Boolean(
+    sock && sock.signalRepository && sock.signalRepository.lidMapping
+  );
 
   const normalizedMessages = [];
   for (const rawMsg of chatUpdate.messages) {
     if (!rawMsg || typeof rawMsg !== 'object') continue;
     const msg = rawMsg;
 
-    if (msg.message) {
-      msg.message = unwrapBaileysMessageContent(msg.message);
-    }
+    if (!normalizedMessageSet.has(msg)) {
+      normalizedMessageSet.add(msg);
 
-    // Map own @lid JIDs (self-chat / linked devices) and Baileys v7 *Alt PN JIDs so owner checks succeed
-    if (msg.key) {
-      if (ownBareLid && ownBarePhoneJid) {
-        if (toBareJid(msg.key.remoteJid) === ownBareLid) {
+      if (msg.message) {
+        msg.message = unwrapBaileysMessageContent(msg.message);
+      }
+
+      // Only rewrite own @lid JIDs on legacy Baileys v6 sockets lacking lidMapping support
+      if (msg.key && !supportsNativeLid) {
+        if (ownBareLid && ownBarePhoneJid) {
+          if (toBareJid(msg.key.remoteJid) === ownBareLid) {
+            msg.key.remoteJid = ownBarePhoneJid;
+          }
+          if (toBareJid(msg.key.participant) === ownBareLid) {
+            msg.key.participant = ownBarePhoneJid;
+          }
+        }
+        if (
+          msg.key.fromMe &&
+          ownBarePhoneJid &&
+          typeof msg.key.remoteJid === 'string' &&
+          msg.key.remoteJid.endsWith('@lid') &&
+          typeof msg.key.remoteJidAlt === 'string' &&
+          toBareJid(msg.key.remoteJidAlt) === ownBarePhoneJid
+        ) {
           msg.key.remoteJid = ownBarePhoneJid;
         }
-        if (toBareJid(msg.key.participant) === ownBareLid) {
+        if (
+          msg.key.fromMe &&
+          ownBarePhoneJid &&
+          typeof msg.key.participant === 'string' &&
+          msg.key.participant.endsWith('@lid') &&
+          typeof msg.key.participantAlt === 'string' &&
+          toBareJid(msg.key.participantAlt) === ownBarePhoneJid
+        ) {
           msg.key.participant = ownBarePhoneJid;
         }
-      }
-      if (
-        msg.key.fromMe &&
-        ownBarePhoneJid &&
-        typeof msg.key.remoteJid === 'string' &&
-        msg.key.remoteJid.endsWith('@lid') &&
-        typeof msg.key.remoteJidAlt === 'string' &&
-        toBareJid(msg.key.remoteJidAlt) === ownBarePhoneJid
-      ) {
-        msg.key.remoteJid = ownBarePhoneJid;
-      }
-      if (
-        msg.key.fromMe &&
-        ownBarePhoneJid &&
-        typeof msg.key.participant === 'string' &&
-        msg.key.participant.endsWith('@lid') &&
-        typeof msg.key.participantAlt === 'string' &&
-        toBareJid(msg.key.participantAlt) === ownBarePhoneJid
-      ) {
-        msg.key.participant = ownBarePhoneJid;
       }
     }
 
@@ -356,10 +381,16 @@ function normalizeIncomingChatUpdate(sock, chatUpdate) {
   return normalizedMessages.map((msg) => {
     const preview = extractReadableText(msg.message).trim();
     if (preview && chatUpdate.type === 'notify') {
-      const chatLabel = msg.key && msg.key.remoteJid ? msg.key.remoteJid : 'unknown';
-      console.log(
-        `[runtime] WhatsApp message from ${chatLabel}: ${preview.slice(0, 48)}${preview.length > 48 ? '...' : ''}`
-      );
+      const chatLabel =
+        (msg.key && (msg.key.remoteJidAlt || msg.key.remoteJid)) || 'unknown';
+      const dedupeKey =
+        (msg.key && msg.key.id) ||
+        `${chatLabel}:${msg.messageTimestamp || ''}:${preview.slice(0, 24)}`;
+      if (recordIncomingLogOnce(dedupeKey)) {
+        console.log(
+          `[runtime] WhatsApp message from ${chatLabel}: ${preview.slice(0, 48)}${preview.length > 48 ? '...' : ''}`
+        );
+      }
     }
     return {
       ...chatUpdate,
@@ -403,12 +434,12 @@ function wrapSocketFactory(fn) {
         const ignoreVal = cfg.shouldIgnoreJid;
         cfg.shouldIgnoreJid = () => ignoreVal;
       }
-      // Low-latency & anti-sleep Baileys socket tuning
-      if (!cfg.connectTimeoutMs || cfg.connectTimeoutMs < 20000 || cfg.connectTimeoutMs > 35000) {
+      // Low-latency & anti-sleep Baileys socket tuning without breaking USync/session queries
+      if (!cfg.connectTimeoutMs || cfg.connectTimeoutMs < 20000 || cfg.connectTimeoutMs > 45000) {
         cfg.connectTimeoutMs = 25000;
       }
-      if (!cfg.defaultQueryTimeoutMs || cfg.defaultQueryTimeoutMs > 15000) {
-        cfg.defaultQueryTimeoutMs = 12000;
+      if (cfg.defaultQueryTimeoutMs === undefined || cfg.defaultQueryTimeoutMs > 45000) {
+        cfg.defaultQueryTimeoutMs = 35000;
       }
       if (!cfg.keepAliveIntervalMs || cfg.keepAliveIntervalMs > 15000) {
         cfg.keepAliveIntervalMs = 15000;
@@ -416,13 +447,15 @@ function wrapSocketFactory(fn) {
       if (cfg.retryRequestDelayMs === undefined || cfg.retryRequestDelayMs > 350) {
         cfg.retryRequestDelayMs = 250;
       }
-      if (cfg.maxMsgRetryCount === undefined || cfg.maxMsgRetryCount > 4) {
-        cfg.maxMsgRetryCount = 3;
+      if (cfg.maxMsgRetryCount === undefined || cfg.maxMsgRetryCount > 5) {
+        cfg.maxMsgRetryCount = 4;
       }
       if (cfg.syncFullHistory === undefined) {
         cfg.syncFullHistory = false;
       }
-      cfg.markOnlineOnConnect = true;
+      if (typeof cfg.markOnlineOnConnect !== 'boolean') {
+        cfg.markOnlineOnConnect = false;
+      }
       nextArgs[0] = cfg;
     }
 
@@ -511,15 +544,26 @@ function wrapSocketFactory(fn) {
         }
       }
 
-      // Guard sendMessage with a 20s timeout so a stalled upload/usync never hangs message handlers
+      // Guard sendMessage with a generous 45s timeout for media uploads/usync and surface dispatch errors
       if (typeof sock.sendMessage === 'function' && !sock.sendMessage.__lyrihostGuarded) {
         const origSendMessage = sock.sendMessage.bind(sock);
+        let lastSendErrLogAt = 0;
         const guardedSendMessage = async (...mArgs) => {
-          const res = await withFastTimeout(origSendMessage(...mArgs), 20000);
-          if (res === '__LYRIHOST_TIMEOUT__') {
-            throw new Error('WhatsApp sendMessage timed out after 20s');
+          try {
+            const res = await withFastTimeout(origSendMessage(...mArgs), 45000);
+            if (res === '__LYRIHOST_TIMEOUT__') {
+              throw new Error('WhatsApp sendMessage timed out after 45s');
+            }
+            return res;
+          } catch (err) {
+            const now = Date.now();
+            if (now - lastSendErrLogAt > 5000) {
+              lastSendErrLogAt = now;
+              const rawMsg = err && err.message ? String(err.message) : String(err || 'Unknown error');
+              console.warn(`[runtime] WhatsApp reply dispatch warning: ${rawMsg.slice(0, 140)}`);
+            }
+            throw err;
           }
-          return res;
         };
         guardedSendMessage.__lyrihostGuarded = true;
         sock.sendMessage = guardedSendMessage;
@@ -537,10 +581,14 @@ function wrapSocketFactory(fn) {
       let hasEverOpened = false;
       let closedSince = 0;
       let loggedOutPermanently = false;
+      let hasSeenPong = false;
+      let hasNoisePingSucceeded = false;
       let missedPongs = 0;
       let missedNoisePings = 0;
       let noisePingInFlight = false;
-      let pongBoundWs = null;
+      let noisePingSeq = 0;
+      let bufferingCycles = 0;
+      const pongBoundSockets = new WeakSet();
 
       const getRawWs = () => {
         const ws = sock.ws;
@@ -548,12 +596,18 @@ function wrapSocketFactory(fn) {
         return ws.socket && typeof ws.socket === 'object' ? ws.socket : ws;
       };
 
-      const bindPongListener = (rawWs) => {
-        if (!rawWs || pongBoundWs === rawWs || typeof rawWs.on !== 'function') return;
-        pongBoundWs = rawWs;
-        rawWs.on('pong', () => {
-          missedPongs = 0;
-        });
+      const bindPongListener = () => {
+        const ws = sock.ws;
+        const rawWs = getRawWs();
+        for (const candidate of [rawWs, ws]) {
+          if (candidate && typeof candidate.on === 'function' && !pongBoundSockets.has(candidate)) {
+            pongBoundSockets.add(candidate);
+            candidate.on('pong', () => {
+              hasSeenPong = true;
+              missedPongs = 0;
+            });
+          }
+        }
       };
 
       const recycleZombieSocket = (reason) => {
@@ -581,10 +635,17 @@ function wrapSocketFactory(fn) {
           clearInterval(keepaliveTimer);
           return;
         }
-        // Ensure event buffer never gets stuck paused after reconnect
+        // Only flush event buffer if it remains stuck buffering across multiple 15s cycles
         try {
-          if (sock.ev && typeof sock.ev.isBuffering === 'function' && sock.ev.isBuffering() && typeof sock.ev.flush === 'function') {
-            sock.ev.flush();
+          if (sock.ev && typeof sock.ev.isBuffering === 'function' && sock.ev.isBuffering()) {
+            bufferingCycles += 1;
+            if (bufferingCycles >= 2 && typeof sock.ev.flush === 'function') {
+              bufferingCycles = 0;
+              sock.ev.flush();
+              console.warn('[runtime] Flushed stalled WhatsApp event buffer.');
+            }
+          } else {
+            bufferingCycles = 0;
           }
         } catch {
           // ignore flush guard error
@@ -597,9 +658,11 @@ function wrapSocketFactory(fn) {
         );
 
         if (wsOpen) {
+          closedSince = 0;
+          bindPongListener();
+
           if (rawWs && typeof rawWs.ping === 'function') {
-            bindPongListener(rawWs);
-            if (missedPongs >= 2) {
+            if (hasSeenPong && missedPongs >= 3) {
               recycleZombieSocket('WhatsApp raw WebSocket stopped responding to RFC-6455 pings');
               return;
             }
@@ -607,48 +670,63 @@ function wrapSocketFactory(fn) {
             try {
               rawWs.ping();
             } catch {
-              missedPongs = 2;
+              missedPongs += 1;
             }
           }
 
-          // Encrypted WhatsApp Noise IQ ping keeps session alive on WA relays & detects silent zombie drops
+          // Encrypted WhatsApp Noise IQ ping using canonical '@s.whatsapp.net' JID
           if (sock.user && typeof sock.query === 'function' && !noisePingInFlight) {
             noisePingInFlight = true;
+            const pingId =
+              typeof sock.generateMessageTag === 'function'
+                ? sock.generateMessageTag()
+                : `lyri-ping-${++noisePingSeq}`;
             withFastTimeout(
               sock.query({
                 tag: 'iq',
-                attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' },
+                attrs: { id: pingId, to: '@s.whatsapp.net', type: 'get', xmlns: 'w:p' },
                 content: [{ tag: 'ping', attrs: {} }],
               }),
-              8000
+              9000
             )
               .then((res) => {
                 if (res === '__LYRIHOST_TIMEOUT__') {
                   missedNoisePings += 1;
-                  if (missedNoisePings >= 2) {
-                    recycleZombieSocket('WhatsApp Noise IQ ping timed out twice (silent zombie session)');
+                  if (
+                    (hasNoisePingSucceeded && missedNoisePings >= 3) ||
+                    (missedPongs >= 3 && missedNoisePings >= 3)
+                  ) {
+                    recycleZombieSocket('WhatsApp Noise IQ ping timed out repeatedly (silent zombie session)');
                   }
                 } else {
+                  hasNoisePingSucceeded = true;
                   missedNoisePings = 0;
                 }
               })
               .catch(() => {
                 missedNoisePings += 1;
-                if (missedNoisePings >= 2) {
-                  recycleZombieSocket('WhatsApp Noise IQ ping failed twice');
+                if (
+                  (hasNoisePingSucceeded && missedNoisePings >= 3) ||
+                  (missedPongs >= 3 && missedNoisePings >= 3)
+                ) {
+                  recycleZombieSocket('WhatsApp Noise IQ ping failed repeatedly');
                 }
               })
               .finally(() => {
                 noisePingInFlight = false;
               });
           }
-        } else if (hasEverOpened && closedSince > 0 && Date.now() - closedSince > 40000) {
-          closedSince = Date.now();
-          console.warn('[runtime] WhatsApp socket stalled offline for 40s; exiting for instant 1s supervisor recovery...');
-          clearInterval(keepaliveTimer);
-          process.exit(1);
+        } else if (hasEverOpened) {
+          if (closedSince === 0) closedSince = Date.now();
+          if (Date.now() - closedSince > 45000) {
+            closedSince = Date.now();
+            console.warn('[runtime] WhatsApp socket stalled offline for 45s; exiting for instant 1s supervisor recovery...');
+            clearInterval(keepaliveTimer);
+            process.exit(1);
+          }
         }
       }, 15000);
+      if (typeof keepaliveTimer.unref === 'function') keepaliveTimer.unref();
 
       globalThis.__lyrihostClearSocketKeepalive = () => clearInterval(keepaliveTimer);
 
@@ -660,7 +738,8 @@ function wrapSocketFactory(fn) {
           closedSince = 0;
           missedPongs = 0;
           missedNoisePings = 0;
-          bindPongListener(getRawWs());
+          bufferingCycles = 0;
+          bindPongListener();
           if (lastLoggedConnState !== 'open') {
             lastLoggedConnState = 'open';
             const jid = (sock.user && (sock.user.jid || sock.user.id)) || 'linked device';
@@ -725,7 +804,10 @@ function wrapSocketFactory(fn) {
                 const singleUpdates = normalizeIncomingChatUpdate(sock, chatUpdate);
                 for (const singleUpdate of singleUpdates) {
                   try {
-                    await withFastTimeout(listener(singleUpdate), 25000);
+                    const res = await withFastTimeout(listener(singleUpdate), 60000);
+                    if (res === '__LYRIHOST_TIMEOUT__') {
+                      console.warn('[runtime] Message handler exceeded 60s timeout; continuing event loop.');
+                    }
                   } catch (err) {
                     console.error('[runtime] Guarded message handler error:', err && err.message ? err.message : err);
                   }
@@ -763,7 +845,10 @@ function wrapSocketFactory(fn) {
                       ? { ...events, 'messages.upsert': singleUpdates[i] }
                       : { 'messages.upsert': singleUpdates[i] };
                   try {
-                    await withFastTimeout(handler(evSlice), 25000);
+                    const res = await withFastTimeout(handler(evSlice), 60000);
+                    if (res === '__LYRIHOST_TIMEOUT__') {
+                      console.warn('[runtime] ev.process message handler exceeded 60s timeout; continuing.');
+                    }
                   } catch (err) {
                     console.error('[runtime] Guarded ev.process handler error:', err && err.message ? err.message : err);
                   }
