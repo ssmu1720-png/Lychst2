@@ -29,9 +29,12 @@ import {
 } from '../src/types/lyrihost.ts';
 import type { TemplateBotSpec, TemplateEnvField } from '../src/catalog/templateBots.ts';
 
+const DEFAULT_LOCAL_DATA_DIR = path.resolve(process.cwd(), 'data');
 export const DATA_DIR = process.env.LYRIHOST_DATA_DIR
   ? path.resolve(process.env.LYRIHOST_DATA_DIR)
-  : path.resolve(process.cwd(), 'data');
+  : process.env.RAILWAY_VOLUME_MOUNT_PATH
+    ? path.join(path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH), 'data')
+    : DEFAULT_LOCAL_DATA_DIR;
 export const DB_FILE = path.join(DATA_DIR, 'lyrihost.db');
 export const LEGACY_STATE_FILE = path.join(DATA_DIR, 'lyrihost-state.json');
 
@@ -164,8 +167,26 @@ export function ensureDailyDbBackup(db: DatabaseSync): void {
 export function getDb(): DatabaseSync {
   if (dbInstance) return dbInstance;
   ensureDataDir();
+  // Auto-migrate local ./data/lyrihost.db into newly mounted persistent volume if destination is empty
+  if (DATA_DIR !== DEFAULT_LOCAL_DATA_DIR && !fs.existsSync(DB_FILE)) {
+    const localDbFile = path.join(DEFAULT_LOCAL_DATA_DIR, 'lyrihost.db');
+    if (fs.existsSync(localDbFile)) {
+      try {
+        fs.copyFileSync(localDbFile, DB_FILE);
+        for (const ext of ['-wal', '-shm']) {
+          if (fs.existsSync(`${localDbFile}${ext}`)) {
+            fs.copyFileSync(`${localDbFile}${ext}`, `${DB_FILE}${ext}`);
+          }
+        }
+        console.log(`[db] Migrated existing database into persistent volume: ${DB_FILE}`);
+      } catch (err) {
+        console.warn('[db] Volume migration copy warning:', err);
+      }
+    }
+  }
   const db = new DatabaseSync(DB_FILE);
   db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA busy_timeout = 5000;');
 
@@ -2323,5 +2344,311 @@ export function createCustomBotTemplate(
 export function deleteCustomBotTemplate(id: string): boolean {
   const res = getDb().prepare('DELETE FROM bot_templates WHERE id = ?').run(id);
   return res.changes > 0;
+}
+
+export function flushDbToDisk(): void {
+  if (!dbInstance) return;
+  try {
+    dbInstance.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  } catch {
+    // ignore checkpoint error on shutdown
+  }
+}
+
+export interface FullDatabaseSnapshot {
+  version: 1;
+  exportedAt: string;
+  dataDir: string;
+  tables: {
+    app_meta: Array<Record<string, unknown>>;
+    users: Array<Record<string, unknown>>;
+    deployments: Array<Record<string, unknown>>;
+    coin_transactions: Array<Record<string, unknown>>;
+    coin_purchases: Array<Record<string, unknown>>;
+    coupons: Array<Record<string, unknown>>;
+    coupon_redemptions: Array<Record<string, unknown>>;
+    support_tickets: Array<Record<string, unknown>>;
+    email_campaigns: Array<Record<string, unknown>>;
+    mpesa_stk_requests: Array<Record<string, unknown>>;
+    bot_templates: Array<Record<string, unknown>>;
+  };
+}
+
+export function exportFullDatabaseSnapshot(): FullDatabaseSnapshot {
+  const db = getDb();
+  flushDbToDisk();
+  return {
+    version: 1,
+    exportedAt: nowIso(),
+    dataDir: DATA_DIR,
+    tables: {
+      app_meta: db.prepare('SELECT * FROM app_meta').all() as Array<Record<string, unknown>>,
+      users: db.prepare('SELECT * FROM users').all() as Array<Record<string, unknown>>,
+      deployments: db.prepare('SELECT * FROM deployments').all() as Array<Record<string, unknown>>,
+      coin_transactions: db.prepare('SELECT * FROM coin_transactions').all() as Array<Record<string, unknown>>,
+      coin_purchases: db.prepare('SELECT * FROM coin_purchases').all() as Array<Record<string, unknown>>,
+      coupons: db.prepare('SELECT * FROM coupons').all() as Array<Record<string, unknown>>,
+      coupon_redemptions: db.prepare('SELECT * FROM coupon_redemptions').all() as Array<Record<string, unknown>>,
+      support_tickets: db.prepare('SELECT * FROM support_tickets').all() as Array<Record<string, unknown>>,
+      email_campaigns: db.prepare('SELECT * FROM email_campaigns').all() as Array<Record<string, unknown>>,
+      mpesa_stk_requests: db.prepare('SELECT * FROM mpesa_stk_requests').all() as Array<Record<string, unknown>>,
+      bot_templates: db.prepare('SELECT * FROM bot_templates').all() as Array<Record<string, unknown>>,
+    },
+  };
+}
+
+export function restoreFullDatabaseSnapshot(snapshot: FullDatabaseSnapshot): {
+  usersRestored: number;
+  deploymentsRestored: number;
+  ticketsRestored: number;
+  couponsRestored: number;
+} {
+  if (!snapshot || snapshot.version !== 1 || !snapshot.tables || typeof snapshot.tables !== 'object') {
+    throw new Error('Invalid Lyrihost backup snapshot format.');
+  }
+
+  const db = getDb();
+  const t = snapshot.tables;
+  let usersRestored = 0;
+  let deploymentsRestored = 0;
+  let ticketsRestored = 0;
+  let couponsRestored = 0;
+
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    for (const row of t.app_meta || []) {
+      if (typeof row.key === 'string' && typeof row.value === 'string') {
+        db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run(row.key, row.value);
+      }
+    }
+
+    for (const row of t.users || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO users
+         (id, email, password_hash, verified, role, coin_balance, max_deployments, referral_code,
+          referred_by_user_id, referral_rewarded, streak_count, last_streak_date, last_streak_claimed_at,
+          promo_emails_opt_in, accepted_terms, consent_accepted_at, preferences_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.email),
+        String(row.password_hash),
+        Number(row.verified ?? 1),
+        String(row.role ?? 'user'),
+        Number(row.coin_balance ?? 0),
+        Number(row.max_deployments ?? DEFAULT_MAX_DEPLOYMENTS),
+        String(row.referral_code),
+        row.referred_by_user_id != null ? String(row.referred_by_user_id) : null,
+        Number(row.referral_rewarded ?? 0),
+        Number(row.streak_count ?? 0),
+        row.last_streak_date != null ? String(row.last_streak_date) : null,
+        row.last_streak_claimed_at != null ? String(row.last_streak_claimed_at) : null,
+        Number(row.promo_emails_opt_in ?? 1),
+        Number(row.accepted_terms ?? 1),
+        row.consent_accepted_at != null ? String(row.consent_accepted_at) : null,
+        row.preferences_json != null ? String(row.preferences_json) : null,
+        String(row.created_at ?? nowIso())
+      );
+      usersRestored += 1;
+    }
+
+    for (const row of t.deployments || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO deployments
+         (id, numeric_id, owner_user_id, owner_email, plan_id, expires_at, memory_limit_mb, status, data_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        Number(row.numeric_id ?? 1),
+        row.owner_user_id != null ? String(row.owner_user_id) : null,
+        row.owner_email != null ? String(row.owner_email) : null,
+        row.plan_id != null ? String(row.plan_id) : 'plan_15d',
+        row.expires_at != null ? String(row.expires_at) : null,
+        Number(row.memory_limit_mb ?? 512),
+        String(row.status ?? 'stopped'),
+        String(row.data_json ?? '{}'),
+        String(row.created_at ?? nowIso()),
+        String(row.updated_at ?? nowIso())
+      );
+      deploymentsRestored += 1;
+    }
+
+    for (const row of t.coin_transactions || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO coin_transactions
+         (id, user_id, type, amount, balance_after, counterparty_email, description, reference_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.user_id),
+        String(row.type),
+        Number(row.amount ?? 0),
+        Number(row.balance_after ?? 0),
+        row.counterparty_email != null ? String(row.counterparty_email) : null,
+        String(row.description ?? ''),
+        row.reference_id != null ? String(row.reference_id) : null,
+        String(row.created_at ?? nowIso())
+      );
+    }
+
+    for (const row of t.coin_purchases || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO coin_purchases
+         (id, user_id, email, coins, amount_ksh, payment_method, payment_reference, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.user_id),
+        String(row.email),
+        Number(row.coins ?? 0),
+        Number(row.amount_ksh ?? 0),
+        String(row.payment_method ?? 'mpesa'),
+        String(row.payment_reference ?? ''),
+        String(row.status ?? 'completed'),
+        String(row.created_at ?? nowIso())
+      );
+    }
+
+    for (const row of t.coupons || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO coupons
+         (code, coins, max_uses, uses_count, target_email, expires_at, created_by, created_at, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.code),
+        Number(row.coins ?? 0),
+        Number(row.max_uses ?? 1),
+        Number(row.uses_count ?? 0),
+        row.target_email != null ? String(row.target_email) : null,
+        row.expires_at != null ? String(row.expires_at) : null,
+        String(row.created_by ?? ADMIN_EMAIL),
+        String(row.created_at ?? nowIso()),
+        Number(row.is_active ?? 1)
+      );
+      couponsRestored += 1;
+    }
+
+    for (const row of t.coupon_redemptions || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO coupon_redemptions
+         (id, coupon_code, user_id, coins, redeemed_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.coupon_code),
+        String(row.user_id),
+        Number(row.coins ?? 0),
+        String(row.redeemed_at ?? nowIso())
+      );
+    }
+
+    for (const row of t.support_tickets || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO support_tickets
+         (id, user_id, user_email, category, priority, subject, message, status, admin_reply, replied_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.user_id),
+        String(row.user_email),
+        String(row.category ?? 'complaint'),
+        String(row.priority ?? 'normal'),
+        String(row.subject ?? ''),
+        String(row.message ?? ''),
+        String(row.status ?? 'open'),
+        row.admin_reply != null ? String(row.admin_reply) : null,
+        row.replied_at != null ? String(row.replied_at) : null,
+        String(row.created_at ?? nowIso()),
+        String(row.updated_at ?? nowIso())
+      );
+      ticketsRestored += 1;
+    }
+
+    for (const row of t.email_campaigns || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO email_campaigns
+         (id, sender_email, recipient_scope, recipient_count, subject, body_text, sent_count, failed_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.sender_email),
+        String(row.recipient_scope ?? 'promo_opted_in'),
+        Number(row.recipient_count ?? 0),
+        String(row.subject ?? ''),
+        String(row.body_text ?? ''),
+        Number(row.sent_count ?? 0),
+        Number(row.failed_count ?? 0),
+        String(row.created_at ?? nowIso())
+      );
+    }
+
+    for (const row of t.mpesa_stk_requests || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO mpesa_stk_requests
+         (id, user_id, email, phone_number, coins, amount_ksh, checkout_request_id, merchant_request_id,
+          mpesa_receipt, status, gateway_message, gateway_dispatched, created_at, completed_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.user_id),
+        String(row.email),
+        String(row.phone_number),
+        Number(row.coins ?? 0),
+        Number(row.amount_ksh ?? 0),
+        row.checkout_request_id != null ? String(row.checkout_request_id) : null,
+        row.merchant_request_id != null ? String(row.merchant_request_id) : null,
+        row.mpesa_receipt != null ? String(row.mpesa_receipt) : null,
+        String(row.status ?? 'pending'),
+        row.gateway_message != null ? String(row.gateway_message) : null,
+        Number(row.gateway_dispatched ?? 0),
+        String(row.created_at ?? nowIso()),
+        row.completed_at != null ? String(row.completed_at) : null,
+        String(row.updated_at ?? nowIso())
+      );
+    }
+
+    for (const row of t.bot_templates || []) {
+      db.prepare(
+        `INSERT OR REPLACE INTO bot_templates
+         (id, name, repo_full_name, repo_url, session_pair_url, session_pair_host, description,
+          image_url, image_alt, platform, framework, runtime, default_branch,
+          install_command, build_command, start_command, default_env_vars_json, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        String(row.id),
+        String(row.name),
+        String(row.repo_full_name),
+        String(row.repo_url),
+        String(row.session_pair_url ?? ''),
+        String(row.session_pair_host ?? ''),
+        String(row.description ?? ''),
+        String(row.image_url ?? ''),
+        String(row.image_alt ?? ''),
+        String(row.platform ?? 'whatsapp'),
+        String(row.framework ?? 'Baileys MD'),
+        String(row.runtime ?? 'node-20'),
+        String(row.default_branch ?? 'main'),
+        String(row.install_command ?? ''),
+        String(row.build_command ?? ''),
+        String(row.start_command ?? 'npm start'),
+        String(row.default_env_vars_json ?? '[]'),
+        String(row.created_by ?? ADMIN_EMAIL),
+        String(row.created_at ?? nowIso())
+      );
+    }
+
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
+
+  flushDbToDisk();
+  return {
+    usersRestored,
+    deploymentsRestored,
+    ticketsRestored,
+    couponsRestored,
+  };
 }
 

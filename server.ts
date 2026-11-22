@@ -17,13 +17,16 @@ import { createBotsRouter } from './server/botsRouter.ts';
 import {
   buildAuthUser,
   deleteDeploymentFromDb,
+  flushDbToDisk,
   getDeploymentPlan,
+  getMeta,
   getUserById,
   getUserPreferences,
   isAdminEmail,
   listCustomBotTemplates,
   renewDeploymentPlan,
   saveUserPreferences,
+  setMeta,
   spendCoinsForDeployment,
 } from './server/db.ts';
 import { createSupportRouter } from './server/supportRouter.ts';
@@ -345,14 +348,15 @@ setInterval(() => {
         } else {
           dep.uptimeSeconds += tickCounter % 2 === 0 ? 2 : 1;
           const probeStart = performance.now();
-          if (dep.pid) {
-            const stats = await sampleProcessStats(dep.pid);
-            if (stats) {
-              dep.cpuPercent = stats.cpuPercent;
-              dep.memoryMb = stats.memoryMb;
-            }
+          const [stats, latencyMs] = await Promise.all([
+            dep.pid ? sampleProcessStats(dep.pid) : Promise.resolve(null),
+            measureBotProbeLatency(dep, probeStart),
+          ]);
+          if (stats) {
+            dep.cpuPercent = stats.cpuPercent;
+            dep.memoryMb = stats.memoryMb;
           }
-          dep.gatewayLatencyMs = await measureBotProbeLatency(dep, probeStart);
+          dep.gatewayLatencyMs = latencyMs;
           dep.onlineChecks = (dep.onlineChecks ?? 0) + 1;
           dep.totalChecks = (dep.totalChecks ?? 0) + 1;
           dep.uptimePercentage =
@@ -1314,14 +1318,46 @@ async function startupBotRestore(): Promise<void> {
 async function startServer() {
   const app = express();
   app.use(cors());
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true }));
+
+  // Auto-detect live public origin so PaaS keepalive pings external ingress even without manual APP_URL env
+  let learnedPublicOrigin = getMeta('public_keepalive_origin') || '';
+  app.use((req, _res, next) => {
+    const rawHost = (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0].trim();
+    const rawProto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim();
+    if (
+      rawHost &&
+      !/^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(rawHost) &&
+      !/\.internal(:\d+)?$/i.test(rawHost)
+    ) {
+      const origin = `${rawProto === 'https' ? 'https' : 'http'}://${rawHost}`;
+      if (origin !== learnedPublicOrigin) {
+        learnedPublicOrigin = origin;
+        try {
+          setMeta('public_keepalive_origin', origin);
+        } catch {
+          // ignore meta write error
+        }
+      }
+    }
+    next();
+  });
 
   // Mount authentication, wallet, support, and admin routes
   app.use('/api/auth', createAuthRouter());
   app.use('/api/wallet', createWalletRouter());
-  app.use('/api/support', createSupportRouter());
-  app.use('/api/admin', createAdminRouter(() => state.deployments));
+  app.use('/api/support', createSupportRouter((userId) => state.deployments.filter((d) => d.ownerUserId === userId)));
+  app.use(
+    '/api/admin',
+    createAdminRouter(
+      () => state.deployments,
+      () => {
+        state = loadState();
+        broadcastDeployments();
+      }
+    )
+  );
 
   // Mount wh-panel-site compatible API routes (/api/bots/*, /api/healthz, /api/system/info)
   app.use(
@@ -2146,21 +2182,48 @@ async function startServer() {
     console.log(`Lyrihost server listening on http://0.0.0.0:${PORT}`);
     void startupBotRestore();
 
-    // Production 24/7 HTTP ingress self-keepalive (prevents PaaS idle sleep when external URL env is set)
-    const rawExternal =
+    // Continuous 24/7 anti-sleep keepalive (every 30s): keeps PaaS ingress, host, and active bot HTTP servers warm
+    const localKeepaliveUrl = `http://127.0.0.1:${PORT}/api/health`;
+    const envExternal =
       process.env.APP_URL?.trim() ||
+      process.env.PUBLIC_URL?.trim() ||
       process.env.RENDER_EXTERNAL_URL?.trim() ||
+      (process.env.RAILWAY_STATIC_URL?.trim()
+        ? `https://${process.env.RAILWAY_STATIC_URL.trim().replace(/^https?:\/\//i, '')}`
+        : '') ||
       (process.env.RAILWAY_PUBLIC_DOMAIN?.trim()
         ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim().replace(/^https?:\/\//i, '')}`
         : '');
-    if (rawExternal && /^https?:\/\//i.test(rawExternal)) {
-      const keepaliveUrl = `${rawExternal.replace(/\/+$/, '')}/api/health`;
-      setInterval(() => {
-        if (state.deployments.some((d) => d.status === 'online' || d.desiredRunning)) {
-          fetch(keepaliveUrl, { method: 'GET', signal: AbortSignal.timeout(5000) }).catch(() => {});
+
+    setInterval(() => {
+      const activeBots = state.deployments.filter((d) => d.status === 'online' || d.desiredRunning);
+      if (activeBots.length === 0) return;
+
+      fetch(localKeepaliveUrl, { method: 'GET', signal: AbortSignal.timeout(3000) }).catch(() => {});
+
+      const externalTarget = envExternal || learnedPublicOrigin;
+      if (externalTarget && /^https?:\/\//i.test(externalTarget)) {
+        const keepaliveUrl = `${externalTarget.replace(/\/+$/, '')}/api/health`;
+        fetch(keepaliveUrl, { method: 'GET', signal: AbortSignal.timeout(5000) }).catch(() => {});
+      }
+
+      for (const dep of activeBots) {
+        const portEntry = dep.settings.envVars.find((v) => v.key === 'PORT' || v.key === 'WEB_PORT');
+        const envPort = portEntry ? Number.parseInt(portEntry.value.trim(), 10) : Number.NaN;
+        const botPort =
+          Number.isInteger(envPort) && envPort > 0 && envPort <= 65535 && envPort !== PORT
+            ? envPort
+            : getAssignedBotPort(dep.numericId);
+        if (botPort > 0 && botPort !== PORT) {
+          const rawPath = (dep.settings.healthCheckPath || '/health').trim();
+          const healthPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+          fetch(`http://127.0.0.1:${botPort}${healthPath}`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(1500),
+          }).catch(() => {});
         }
-      }, 4 * 60 * 1000).unref();
-    }
+      }
+    }, 30 * 1000).unref();
   });
 }
 
@@ -2168,3 +2231,17 @@ startServer().catch((err) => {
   console.error('Fatal server startup error:', err);
   process.exit(1);
 });
+
+const handleGracefulShutdown = (signal: string) => {
+  console.log(`[server] Received ${signal}; flushing database and saving state...`);
+  try {
+    saveState();
+    flushDbToDisk();
+  } catch {
+    // ignore shutdown flush failure
+  }
+  process.exit(0);
+};
+
+process.on('SIGTERM', () => handleGracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => handleGracefulShutdown('SIGINT'));

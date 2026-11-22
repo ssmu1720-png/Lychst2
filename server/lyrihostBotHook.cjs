@@ -368,6 +368,17 @@ function normalizeIncomingChatUpdate(sock, chatUpdate) {
   });
 }
 
+function withFastTimeout(promise, ms) {
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('__LYRIHOST_TIMEOUT__'), ms);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise), timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 function wrapSocketFactory(fn) {
   if (typeof fn !== 'function' || fn.__lyrihostWrapped) return fn;
   const wrapped = function lyrihostWrappedMakeWASocket(...args) {
@@ -392,15 +403,26 @@ function wrapSocketFactory(fn) {
         const ignoreVal = cfg.shouldIgnoreJid;
         cfg.shouldIgnoreJid = () => ignoreVal;
       }
-      if (!cfg.connectTimeoutMs || cfg.connectTimeoutMs < 45000) {
-        cfg.connectTimeoutMs = 45000;
+      // Low-latency & anti-sleep Baileys socket tuning
+      if (!cfg.connectTimeoutMs || cfg.connectTimeoutMs < 20000 || cfg.connectTimeoutMs > 35000) {
+        cfg.connectTimeoutMs = 25000;
       }
-      if (!cfg.defaultQueryTimeoutMs || cfg.defaultQueryTimeoutMs < 45000) {
-        cfg.defaultQueryTimeoutMs = 45000;
+      if (!cfg.defaultQueryTimeoutMs || cfg.defaultQueryTimeoutMs > 15000) {
+        cfg.defaultQueryTimeoutMs = 12000;
       }
-      if (!cfg.keepAliveIntervalMs) {
-        cfg.keepAliveIntervalMs = 25000;
+      if (!cfg.keepAliveIntervalMs || cfg.keepAliveIntervalMs > 15000) {
+        cfg.keepAliveIntervalMs = 15000;
       }
+      if (cfg.retryRequestDelayMs === undefined || cfg.retryRequestDelayMs > 350) {
+        cfg.retryRequestDelayMs = 250;
+      }
+      if (cfg.maxMsgRetryCount === undefined || cfg.maxMsgRetryCount > 4) {
+        cfg.maxMsgRetryCount = 3;
+      }
+      if (cfg.syncFullHistory === undefined) {
+        cfg.syncFullHistory = false;
+      }
+      cfg.markOnlineOnConnect = true;
       nextArgs[0] = cfg;
     }
 
@@ -417,13 +439,65 @@ function wrapSocketFactory(fn) {
         return true;
       };
 
-      for (const method of ['updateProfileStatus', 'sendPresenceUpdate']) {
+      // Cache groupMetadata for 20s to eliminate 1-4s per-command WhatsApp IQ lag
+      const groupMetaCache = new Map();
+      const groupMetaInFlight = new Map();
+      const invalidateGroupCache = (jid) => {
+        if (typeof jid === 'string' && jid) {
+          groupMetaCache.delete(jid);
+        }
+      };
+
+      if (typeof sock.groupMetadata === 'function' && !sock.groupMetadata.__lyrihostCached) {
+        const origGroupMetadata = sock.groupMetadata.bind(sock);
+        const cachedGroupMetadata = async (jid) => {
+          if (typeof jid !== 'string' || !jid) {
+            return origGroupMetadata(jid);
+          }
+          const now = Date.now();
+          const cached = groupMetaCache.get(jid);
+          if (cached && cached.expiresAt > now) {
+            return cached.data;
+          }
+          if (groupMetaInFlight.has(jid)) {
+            return groupMetaInFlight.get(jid);
+          }
+          const fetchPromise = (async () => {
+            try {
+              const result = await withFastTimeout(origGroupMetadata(jid), 8000);
+              if (result === '__LYRIHOST_TIMEOUT__') {
+                if (cached) return cached.data;
+                throw new Error(`groupMetadata timed out for ${jid}`);
+              }
+              if (result && typeof result === 'object') {
+                groupMetaCache.set(jid, { data: result, expiresAt: Date.now() + 20000 });
+              }
+              return result;
+            } catch (err) {
+              if (cached && isTransientSocketError(err)) {
+                return cached.data;
+              }
+              throw err;
+            } finally {
+              groupMetaInFlight.delete(jid);
+            }
+          })();
+          groupMetaInFlight.set(jid, fetchPromise);
+          return fetchPromise;
+        };
+        cachedGroupMetadata.__lyrihostCached = true;
+        sock.groupMetadata = cachedGroupMetadata;
+      }
+
+      // Guard non-critical ack/presence calls with fast 3s timeout so slow WA ACKs never stall bot replies
+      for (const method of ['updateProfileStatus', 'sendPresenceUpdate', 'readMessages']) {
         if (typeof sock[method] === 'function' && !sock[method].__lyrihostGuarded) {
           const origMethod = sock[method].bind(sock);
           const guardedMethod = async (...mArgs) => {
             if (!isSocketOpen()) return undefined;
             try {
-              return await origMethod(...mArgs);
+              const res = await withFastTimeout(origMethod(...mArgs), 3000);
+              return res === '__LYRIHOST_TIMEOUT__' ? undefined : res;
             } catch (err) {
               if (isTransientSocketError(err)) {
                 logTransientNotice(err);
@@ -437,16 +511,164 @@ function wrapSocketFactory(fn) {
         }
       }
 
+      // Guard sendMessage with a 20s timeout so a stalled upload/usync never hangs message handlers
+      if (typeof sock.sendMessage === 'function' && !sock.sendMessage.__lyrihostGuarded) {
+        const origSendMessage = sock.sendMessage.bind(sock);
+        const guardedSendMessage = async (...mArgs) => {
+          const res = await withFastTimeout(origSendMessage(...mArgs), 20000);
+          if (res === '__LYRIHOST_TIMEOUT__') {
+            throw new Error('WhatsApp sendMessage timed out after 20s');
+          }
+          return res;
+        };
+        guardedSendMessage.__lyrihostGuarded = true;
+        sock.sendMessage = guardedSendMessage;
+      }
+
+      if (typeof globalThis.__lyrihostClearSocketKeepalive === 'function') {
+        try {
+          globalThis.__lyrihostClearSocketKeepalive();
+        } catch {
+          // ignore
+        }
+      }
+
       let lastLoggedConnState = '';
+      let hasEverOpened = false;
+      let closedSince = 0;
+      let loggedOutPermanently = false;
+      let missedPongs = 0;
+      let missedNoisePings = 0;
+      let noisePingInFlight = false;
+      let pongBoundWs = null;
+
+      const getRawWs = () => {
+        const ws = sock.ws;
+        if (!ws) return null;
+        return ws.socket && typeof ws.socket === 'object' ? ws.socket : ws;
+      };
+
+      const bindPongListener = (rawWs) => {
+        if (!rawWs || pongBoundWs === rawWs || typeof rawWs.on !== 'function') return;
+        pongBoundWs = rawWs;
+        rawWs.on('pong', () => {
+          missedPongs = 0;
+        });
+      };
+
+      const recycleZombieSocket = (reason) => {
+        missedPongs = 0;
+        missedNoisePings = 0;
+        console.warn(`[runtime] ${reason}; recycling WhatsApp socket immediately...`);
+        const ws = sock.ws;
+        const rawWs = getRawWs();
+        try {
+          if (rawWs && typeof rawWs.terminate === 'function') {
+            rawWs.terminate();
+          } else if (ws && typeof ws.close === 'function') {
+            ws.close();
+          } else if (typeof sock.end === 'function') {
+            sock.end(new Error(reason));
+          }
+        } catch {
+          // ignore socket termination failure
+        }
+      };
+
+      // Active 15s WebSocket + WhatsApp Noise IQ keepalive (stops 10-min NAT & WhatsApp edge silence)
+      const keepaliveTimer = setInterval(() => {
+        if (loggedOutPermanently) {
+          clearInterval(keepaliveTimer);
+          return;
+        }
+        // Ensure event buffer never gets stuck paused after reconnect
+        try {
+          if (sock.ev && typeof sock.ev.isBuffering === 'function' && sock.ev.isBuffering() && typeof sock.ev.flush === 'function') {
+            sock.ev.flush();
+          }
+        } catch {
+          // ignore flush guard error
+        }
+
+        const ws = sock.ws;
+        const rawWs = getRawWs();
+        const wsOpen = Boolean(
+          (rawWs && rawWs.readyState === 1) || (ws && (ws.isOpen === true || ws.readyState === 1))
+        );
+
+        if (wsOpen) {
+          if (rawWs && typeof rawWs.ping === 'function') {
+            bindPongListener(rawWs);
+            if (missedPongs >= 2) {
+              recycleZombieSocket('WhatsApp raw WebSocket stopped responding to RFC-6455 pings');
+              return;
+            }
+            missedPongs += 1;
+            try {
+              rawWs.ping();
+            } catch {
+              missedPongs = 2;
+            }
+          }
+
+          // Encrypted WhatsApp Noise IQ ping keeps session alive on WA relays & detects silent zombie drops
+          if (sock.user && typeof sock.query === 'function' && !noisePingInFlight) {
+            noisePingInFlight = true;
+            withFastTimeout(
+              sock.query({
+                tag: 'iq',
+                attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' },
+                content: [{ tag: 'ping', attrs: {} }],
+              }),
+              8000
+            )
+              .then((res) => {
+                if (res === '__LYRIHOST_TIMEOUT__') {
+                  missedNoisePings += 1;
+                  if (missedNoisePings >= 2) {
+                    recycleZombieSocket('WhatsApp Noise IQ ping timed out twice (silent zombie session)');
+                  }
+                } else {
+                  missedNoisePings = 0;
+                }
+              })
+              .catch(() => {
+                missedNoisePings += 1;
+                if (missedNoisePings >= 2) {
+                  recycleZombieSocket('WhatsApp Noise IQ ping failed twice');
+                }
+              })
+              .finally(() => {
+                noisePingInFlight = false;
+              });
+          }
+        } else if (hasEverOpened && closedSince > 0 && Date.now() - closedSince > 40000) {
+          closedSince = Date.now();
+          console.warn('[runtime] WhatsApp socket stalled offline for 40s; exiting for instant 1s supervisor recovery...');
+          clearInterval(keepaliveTimer);
+          process.exit(1);
+        }
+      }, 15000);
+
+      globalThis.__lyrihostClearSocketKeepalive = () => clearInterval(keepaliveTimer);
+
       const logConnUpdate = (update) => {
         if (!update || typeof update !== 'object') return;
         const conn = update.connection;
-        if (conn === 'open' && lastLoggedConnState !== 'open') {
-          lastLoggedConnState = 'open';
-          const jid = (sock.user && (sock.user.jid || sock.user.id)) || 'linked device';
-          console.log(`[runtime] WhatsApp socket connected as ${jid}.`);
+        if (conn === 'open') {
+          hasEverOpened = true;
+          closedSince = 0;
+          missedPongs = 0;
+          missedNoisePings = 0;
+          bindPongListener(getRawWs());
+          if (lastLoggedConnState !== 'open') {
+            lastLoggedConnState = 'open';
+            const jid = (sock.user && (sock.user.jid || sock.user.id)) || 'linked device';
+            console.log(`[runtime] WhatsApp socket connected as ${jid}.`);
+          }
         } else if (update.qr && lastLoggedConnState !== 'qr') {
           lastLoggedConnState = 'qr';
+          closedSince = 0;
           console.log('[runtime] QR code generated — scan via WhatsApp > Linked Devices or set a valid SESSION_ID.');
         } else if (conn === 'close') {
           lastLoggedConnState = 'close';
@@ -456,10 +678,26 @@ function wrapSocketFactory(fn) {
             update.lastDisconnect.error.output &&
             update.lastDisconnect.error.output.statusCode;
           if (statusCode === 401 || statusCode === 403) {
+            loggedOutPermanently = true;
+            closedSince = 0;
+            clearInterval(keepaliveTimer);
             console.warn(`[runtime] WhatsApp rejected session (code ${statusCode}). Regenerate SESSION_ID from the pairing site and redeploy.`);
-          } else if (statusCode) {
-            console.warn(`[runtime] WhatsApp connection closed (code ${statusCode}); waiting for reconnect.`);
+          } else {
+            if (closedSince === 0) closedSince = Date.now();
+            if (statusCode) {
+              console.warn(`[runtime] WhatsApp connection closed (code ${statusCode}); reconnecting...`);
+            }
           }
+        }
+      };
+
+      const invalidateFromGroupEvents = (event, payload) => {
+        if (event === 'groups.update' && Array.isArray(payload)) {
+          for (const g of payload) {
+            if (g && g.id) invalidateGroupCache(g.id);
+          }
+        } else if (event === 'group-participants.update' && payload && payload.id) {
+          invalidateGroupCache(payload.id);
         }
       };
 
@@ -475,13 +713,19 @@ function wrapSocketFactory(fn) {
                 return listener(update);
               });
             }
+            if ((event === 'groups.update' || event === 'group-participants.update') && typeof listener === 'function') {
+              return origEvOn(event, (payload) => {
+                invalidateFromGroupEvents(event, payload);
+                return listener(payload);
+              });
+            }
             if (event === 'messages.upsert' && typeof listener === 'function') {
               return origEvOn(event, async (chatUpdate) => {
                 syncSocketUserJid(sock);
                 const singleUpdates = normalizeIncomingChatUpdate(sock, chatUpdate);
                 for (const singleUpdate of singleUpdates) {
                   try {
-                    await listener(singleUpdate);
+                    await withFastTimeout(listener(singleUpdate), 25000);
                   } catch (err) {
                     console.error('[runtime] Guarded message handler error:', err && err.message ? err.message : err);
                   }
@@ -500,8 +744,10 @@ function wrapSocketFactory(fn) {
             }
             return origEvProcess(async (events) => {
               syncSocketUserJid(sock);
-              if (events && events['connection.update']) {
-                logConnUpdate(events['connection.update']);
+              if (events) {
+                if (events['groups.update']) invalidateFromGroupEvents('groups.update', events['groups.update']);
+                if (events['group-participants.update']) invalidateFromGroupEvents('group-participants.update', events['group-participants.update']);
+                if (events['connection.update']) logConnUpdate(events['connection.update']);
               }
               if (events && events['messages.upsert']) {
                 const singleUpdates = normalizeIncomingChatUpdate(sock, events['messages.upsert']);
@@ -517,7 +763,7 @@ function wrapSocketFactory(fn) {
                       ? { ...events, 'messages.upsert': singleUpdates[i] }
                       : { 'messages.upsert': singleUpdates[i] };
                   try {
-                    await handler(evSlice);
+                    await withFastTimeout(handler(evSlice), 25000);
                   } catch (err) {
                     console.error('[runtime] Guarded ev.process handler error:', err && err.message ? err.message : err);
                   }
@@ -687,6 +933,19 @@ try {
       }
 
       return origListen.apply(this, args);
+    };
+  }
+
+  if (typeof net.Socket.prototype.connect === 'function') {
+    const origConnect = net.Socket.prototype.connect;
+    net.Socket.prototype.connect = function patchedConnect(...args) {
+      try {
+        if (typeof this.setNoDelay === 'function') this.setNoDelay(true);
+        if (typeof this.setKeepAlive === 'function') this.setKeepAlive(true, 15000);
+      } catch {
+        // ignore socket option failures before connect
+      }
+      return origConnect.apply(this, args);
     };
   }
 } catch {

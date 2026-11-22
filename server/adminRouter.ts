@@ -6,6 +6,7 @@ import {
   createCustomBotTemplate,
   deleteCoupon,
   deleteCustomBotTemplate,
+  exportFullDatabaseSnapshot,
   getAdminAppDetails,
   listAllAdminUsers,
   listAllTickets,
@@ -16,8 +17,10 @@ import {
   makeId,
   nowIso,
   recordEmailCampaign,
+  restoreFullDatabaseSnapshot,
   toggleCouponActive,
   updateTicketReply,
+  type FullDatabaseSnapshot,
 } from './db.ts';
 import { getEmailTransportStatus, sendBrandedNotificationEmail } from './emailService.ts';
 import type {
@@ -28,7 +31,10 @@ import type {
   SupportTicketStatus,
 } from '../src/types/lyrihost.ts';
 
-export function createAdminRouter(getDeployments: () => BotDeployment[]): IRouter {
+export function createAdminRouter(
+  getDeployments: () => BotDeployment[],
+  reloadRuntimeState?: () => void
+): IRouter {
   const router: IRouter = Router();
   router.use(requireAuth, requireAdmin);
 
@@ -364,6 +370,31 @@ export function createAdminRouter(getDeployments: () => BotDeployment[]): IRoute
       return;
     }
     res.json({ deleted: true });
+  });
+
+  router.get('/backup', (_req: AuthenticatedRequest, res) => {
+    const snapshot = exportFullDatabaseSnapshot();
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Disposition', `attachment; filename="lyrihost-backup-${dateStamp}.json"`);
+    res.json(snapshot);
+  });
+
+  router.post('/restore', (req: AuthenticatedRequest, res) => {
+    try {
+      const snapshot = req.body as FullDatabaseSnapshot;
+      const result = restoreFullDatabaseSnapshot(snapshot);
+      if (reloadRuntimeState) {
+        reloadRuntimeState();
+      }
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Unable to restore backup snapshot.',
+      });
+    }
   });
 
   return router;

@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Coins,
   Database,
+  Download,
   Mail,
   MessageSquare,
   Plus,
@@ -14,6 +15,7 @@ import {
   Shield,
   Ticket,
   Trash2,
+  Upload,
   Users,
 } from 'lucide-react';
 import {
@@ -63,6 +65,7 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
   } | null>(null);
   const [testingEmail, setTestingEmail] = useState(false);
   const [testRecipientEmail, setTestRecipientEmail] = useState('');
+  const [backupBusy, setBackupBusy] = useState(false);
   const [deployments, setDeployments] = useState<BotDeployment[]>([]);
   const [customTemplates, setCustomTemplates] = useState<TemplateBotSpec[]>([]);
 
@@ -580,6 +583,98 @@ export function AdminView({ authToken, onSelectBot, onBotAction }: AdminViewProp
                 <dd className="mt-0.5 text-slate-200">{details.activeCouponsCount}</dd>
               </div>
             </dl>
+            <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-red-950/70 pt-4">
+              <div className="text-[11px] text-slate-400">
+                Export or restore all users, coin balances, transactions, tickets, templates, and deployment configs.
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={backupBusy}
+                  onClick={async () => {
+                    setBackupBusy(true);
+                    setFeedback(null);
+                    try {
+                      const resp = await fetch('/api/admin/backup', {
+                        headers: { Authorization: `Bearer ${authToken}` },
+                      });
+                      if (!resp.ok) throw new Error('Failed to export database backup.');
+                      const blob = await resp.blob();
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `lyrihost-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                      setFeedback({
+                        type: 'success',
+                        text: 'Downloaded full user & deployment backup snapshot (.json).',
+                      });
+                    } catch (err) {
+                      setFeedback({
+                        type: 'error',
+                        text: err instanceof Error ? err.message : 'Backup download failed.',
+                      });
+                    } finally {
+                      setBackupBusy(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/45 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-60"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Download User Data Backup
+                </button>
+
+                <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-red-500/45 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-rose-200 hover:bg-red-500/20">
+                  <Upload className="h-3.5 w-3.5" />
+                  Restore Backup (.json)
+                  <input
+                    type="file"
+                    accept=".json,application/json"
+                    className="hidden"
+                    disabled={backupBusy}
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = '';
+                      if (!file) return;
+                      setBackupBusy(true);
+                      setFeedback(null);
+                      try {
+                        const raw = await file.text();
+                        const parsed = JSON.parse(raw);
+                        const resp = await fetch('/api/admin/restore', {
+                          method: 'POST',
+                          headers,
+                          body: JSON.stringify(parsed),
+                        });
+                        const data = (await resp.json()) as {
+                          ok?: boolean;
+                          usersRestored?: number;
+                          deploymentsRestored?: number;
+                          ticketsRestored?: number;
+                          error?: string;
+                        };
+                        if (!resp.ok || !data.ok) {
+                          throw new Error(data.error || 'Failed to restore backup.');
+                        }
+                        await loadAllAdmin();
+                        setFeedback({
+                          type: 'success',
+                          text: `Restored ${data.usersRestored ?? 0} users, ${data.deploymentsRestored ?? 0} deployments, and ${data.ticketsRestored ?? 0} tickets.`,
+                        });
+                      } catch (err) {
+                        setFeedback({
+                          type: 'error',
+                          text: err instanceof Error ? err.message : 'Restore backup failed.',
+                        });
+                      } finally {
+                        setBackupBusy(false);
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
           </div>
         </section>
       )}

@@ -100,6 +100,7 @@ export interface LogEntry {
 }
 
 export const ADMIN_EMAIL = 'sharksam004@gmail.com';
+export const SUPPORT_PHONE = '254106625145';
 
 export type DeploymentPlanId = 'plan_15d' | 'plan_30d' | 'plan_unlimited';
 

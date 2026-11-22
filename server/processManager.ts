@@ -3,7 +3,11 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const BOTS_DIR = process.env.BOTS_DIR || path.join(process.cwd(), 'bot_instances');
+const BOTS_DIR = process.env.BOTS_DIR
+  ? path.resolve(process.env.BOTS_DIR)
+  : process.env.RAILWAY_VOLUME_MOUNT_PATH
+    ? path.join(path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH), 'bot_instances')
+    : path.join(process.cwd(), 'bot_instances');
 
 export interface BotProcess {
   pid: number;
@@ -139,7 +143,7 @@ function clearPendingRestartTimer(botId: string): void {
 }
 
 function computeRestartDelayMs(failureCount: number): number {
-  const schedule = [2000, 5000, 12000, 25000, 45000, 60000];
+  const schedule = [1000, 2500, 5000, 12000, 25000, 45000];
   const idx = Math.max(0, Math.min(schedule.length - 1, failureCount - 1));
   return schedule[idx];
 }
@@ -308,6 +312,7 @@ export function startProcess(
       NODE_OPTIONS: nodeOptions,
       NODE_NO_WARNINGS: '1',
       PYTHONUNBUFFERED: '1',
+      UV_THREADPOOL_SIZE: '16',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: true,
@@ -494,11 +499,24 @@ export function sendRawInput(botId: string, rawData: string): boolean {
   }
 }
 
-export function sampleProcessStats(pid: number): Promise<{ cpuPercent: number; memoryMb: number } | null> {
+const statsCache = new Map<number, { value: { cpuPercent: number; memoryMb: number } | null; expiresAt: number }>();
+
+export function sampleProcessStats(
+  pid: number,
+  options: { bypassCache?: boolean } = {}
+): Promise<{ cpuPercent: number; memoryMb: number } | null> {
   return new Promise((resolve) => {
     if (!pid || pid <= 0) {
       resolve(null);
       return;
+    }
+    const now = Date.now();
+    if (!options.bypassCache) {
+      const cached = statsCache.get(pid);
+      if (cached && cached.expiresAt > now) {
+        resolve(cached.value);
+        return;
+      }
     }
     const args =
       process.platform === 'linux'
@@ -510,14 +528,19 @@ export function sampleProcessStats(pid: number): Promise<{ cpuPercent: number; m
         // Fallback to single PID query if process group query returns empty
         execFile('ps', ['-p', String(pid), '-o', '%cpu=,rss='], { timeout: 1000 }, (err2, out2) => {
           if (err2 || !out2.trim()) {
+            statsCache.set(pid, { value: null, expiresAt: Date.now() + 4500 });
             resolve(null);
             return;
           }
-          resolve(parsePsOutput(out2));
+          const parsed = parsePsOutput(out2);
+          statsCache.set(pid, { value: parsed, expiresAt: Date.now() + 4500 });
+          resolve(parsed);
         });
         return;
       }
-      resolve(parsePsOutput(stdout));
+      const parsed = parsePsOutput(stdout);
+      statsCache.set(pid, { value: parsed, expiresAt: Date.now() + 4500 });
+      resolve(parsed);
     });
   });
 }
@@ -582,7 +605,7 @@ export async function probeBotProcessHealth(params: {
     }
   }
 
-  const stats = alive && activePid ? await sampleProcessStats(activePid) : null;
+  const stats = alive && activePid ? await sampleProcessStats(activePid, { bypassCache: true }) : null;
   const candidatePort =
     params.customPort && params.customPort > 0 && params.customPort <= 65535
       ? params.customPort
