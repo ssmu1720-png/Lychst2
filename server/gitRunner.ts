@@ -320,7 +320,7 @@ export function resolveDeploymentCommands(
       pkg = {};
     }
 
-    // Adapt package managers not installed in runtime (e.g. pnpm/yarn/bun -> npm fallback)
+    // Adapt package managers not installed in runtime or brittle frozen/ci commands
     if (/^\s*pnpm\b/i.test(installCommand) && !commandExists('pnpm')) {
       installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
       notes.push('pnpm binary not present; adapted install command to npm.');
@@ -330,9 +330,13 @@ export function resolveDeploymentCommands(
     } else if (/^\s*bun\b/i.test(installCommand) && !commandExists('bun')) {
       installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
       notes.push('bun binary not present; adapted install command to npm.');
-    } else if (/^\s*npm\s+ci\b/i.test(installCommand) && !fs.existsSync(path.join(botDir, 'package-lock.json'))) {
+    } else if (/^\s*npm\s+ci\b/i.test(installCommand)) {
       installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
-      notes.push('package-lock.json missing; switched npm ci to npm install.');
+      if (!fs.existsSync(path.join(botDir, 'package-lock.json'))) {
+        notes.push('package-lock.json missing; switched npm ci to compatible npm install.');
+      }
+    } else if (/^\s*npm\s+install\s*$/i.test(installCommand)) {
+      installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
     } else if (!installCommand && (pkg.scripts || fs.existsSync(pkgPath))) {
       installCommand = 'npm install --legacy-peer-deps --ignore-engines --no-audit --no-fund';
     }
@@ -349,28 +353,94 @@ export function resolveDeploymentCommands(
       buildCommand = pkg.scripts?.build ? 'npm run build' : '';
     }
 
-    // Resolve start command when `package.json` has no `scripts.start` or uses missing runtime binary
+    // Unwrap PM2 / Nodemon / Forever process-manager wrappers so bots run directly under Lyrihost's 24/7 supervisor
+    const extractDirectScriptTarget = (cmdText: string): string | null => {
+      const pm2Match = cmdText.match(/\b(?:pm2|pm2-runtime|forever)\s+(?:start\s+)?([^\s;&|]+)/i);
+      if (pm2Match && pm2Match[1] && !pm2Match[1].startsWith('-')) {
+        if (/ecosystem\.config\.(?:c?js|json)$/i.test(pm2Match[1])) {
+          return ['index.js', 'bot.js', 'main.js', 'server.js'].find((f) => fs.existsSync(path.join(botDir, f))) || null;
+        }
+        return pm2Match[1];
+      }
+      const nodemonMatch = cmdText.match(/\bnodemon\s+([^\s;&|]+)/i);
+      if (nodemonMatch && nodemonMatch[1] && !nodemonMatch[1].startsWith('-')) {
+        return nodemonMatch[1];
+      }
+      return null;
+    };
+
+    const unwrapStartTarget = (cmdText: string): string | null => {
+      const directTarget = extractDirectScriptTarget(cmdText);
+      if (!directTarget) return null;
+      if (/\.(?:ts|tsx|mts|cts)$/i.test(directTarget)) {
+        return `npx --yes tsx ${JSON.stringify(directTarget)}`;
+      }
+      return `node ${JSON.stringify(directTarget)}`;
+    };
+
     const isDefaultStart =
       /^(npm\s+start|npm\s+run\s+start|yarn\s+start|pnpm\s+start|bun\s+run\s+start|docker\s+run)/i.test(
         startCommand
       );
 
-    if (isDefaultStart && (!pkg.scripts || !pkg.scripts.start)) {
+    const directOverride = unwrapStartTarget(startCommand);
+    if (directOverride) {
+      startCommand = directOverride;
+      notes.push(`Adapted external process manager command to direct supervised execution (${startCommand}).`);
+    } else if (
+      isDefaultStart &&
+      pkg.scripts?.start &&
+      (/\b(?:pm2|pm2-runtime|nodemon|forever)\b/i.test(pkg.scripts.start) ||
+        (/^\s*bun\b/i.test(pkg.scripts.start) && !commandExists('bun')))
+    ) {
+      const unwrapped = unwrapStartTarget(pkg.scripts.start);
+      if (unwrapped) {
+        startCommand = unwrapped;
+        notes.push(`Unwrapped package.json start script under Lyrihost 24/7 supervisor (${startCommand}).`);
+      } else if (/^\s*bun\s+(?:run\s+)?([^\s;&|]+)/i.test(pkg.scripts.start)) {
+        const bunTarget = pkg.scripts.start.match(/^\s*bun\s+(?:run\s+)?([^\s;&|]+)/i)?.[1];
+        if (bunTarget && /\.(?:ts|tsx|js|mjs|cjs)$/i.test(bunTarget)) {
+          startCommand = /\.(?:ts|tsx)$/i.test(bunTarget)
+            ? `npx --yes tsx ${JSON.stringify(bunTarget)}`
+            : `node ${JSON.stringify(bunTarget)}`;
+          notes.push(`Adapted Bun script to Node execution (${startCommand}).`);
+        }
+      }
+    } else if (isDefaultStart && (!pkg.scripts || !pkg.scripts.start)) {
       const nodeCandidates = [
         pkg.main,
+        'dist/index.js',
+        'build/index.js',
         'index.js',
         'bot.js',
         'main.js',
         'app.js',
         'server.js',
+        'index.mjs',
+        'index.cjs',
         'src/index.js',
         'src/bot.js',
+        'src/main.js',
+        'index.ts',
+        'bot.ts',
+        'main.ts',
+        'src/index.ts',
+        'src/bot.ts',
+        'src/main.ts',
       ].filter((c): c is string => Boolean(c));
 
       const matchedEntry = nodeCandidates.find((rel) => fs.existsSync(path.join(botDir, rel)));
       if (matchedEntry) {
-        startCommand = `node ${JSON.stringify(matchedEntry)}`;
-        notes.push(`package.json has no "start" script; auto-selected entrypoint ${matchedEntry}.`);
+        if (/\.(?:ts|tsx|mts|cts)$/i.test(matchedEntry)) {
+          if (pkg.scripts?.build && !buildCommand) {
+            buildCommand = 'npm run build';
+          }
+          startCommand = `npx --yes tsx ${JSON.stringify(matchedEntry)}`;
+          notes.push(`package.json has no "start" script; auto-selected TypeScript entrypoint ${matchedEntry}.`);
+        } else {
+          startCommand = `node ${JSON.stringify(matchedEntry)}`;
+          notes.push(`package.json has no "start" script; auto-selected entrypoint ${matchedEntry}.`);
+        }
       }
     } else if (/^\s*bun\s+(run\s+)?start\b/i.test(startCommand) && !commandExists('bun')) {
       startCommand = 'npm start';
@@ -388,6 +458,9 @@ export function resolveDeploymentCommands(
       if (hasReq) {
         installCommand = `${pyBin} -m pip install --break-system-packages -r requirements.txt || pip3 install --break-system-packages -r requirements.txt`;
         notes.push('Detected Python repository; adapted install command to pip requirements.txt.');
+      } else if (hasPyproj) {
+        installCommand = `${pyBin} -m pip install --break-system-packages . || pip3 install --break-system-packages .`;
+        notes.push('Detected pyproject.toml; adapted install command to pip install.');
       } else {
         installCommand = '';
       }
@@ -438,6 +511,7 @@ export function runShellStep(
       npm_config_fund: 'false',
       npm_config_prefer_offline: 'false',
       PUPPETEER_SKIP_DOWNLOAD: 'true',
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
       SHARP_IGNORE_GLOBAL_LIBVIPS: '1',
       PYTHONUNBUFFERED: '1',
       PIP_DISABLE_PIP_VERSION_CHECK: '1',

@@ -320,15 +320,13 @@ export function startProcess(
   intentionallyStopped.delete(botId);
   clearPendingRestartTimer(botId);
 
-  const heapLimitMb = Math.max(768, Math.min(2048, options.memoryLimitMb || 768));
-  const hookPath = path.resolve(process.cwd(), 'server', 'lyrihostBotHook.cjs');
-  const nodeOptions = fs.existsSync(hookPath)
-    ? `--require ${JSON.stringify(hookPath)} --max-old-space-size=${heapLimitMb}`
-    : `--max-old-space-size=${heapLimitMb}`;
+  const heapLimitMb = Math.max(512, Math.min(2048, options.memoryLimitMb || 512));
+  const nodeOptions = `--max-old-space-size=${heapLimitMb}`;
 
-  const hostPort = String(process.env.PORT || 3000);
   const parentEnv: NodeJS.ProcessEnv = { ...process.env };
   delete parentEnv.PORT;
+  delete parentEnv.npm_config_production;
+  delete parentEnv.NPM_CONFIG_PRODUCTION;
 
   const assignedPort = String(getAssignedBotPort(options.numericId));
   const child = spawn(trimmedCmd, {
@@ -336,15 +334,15 @@ export function startProcess(
     env: {
       ...parentEnv,
       PORT: assignedPort,
-      LYRIHOST_HOST_PORT: hostPort,
       ...(options.env || {}),
       NODE_ENV: 'production',
       TERM: 'xterm-256color',
       FORCE_COLOR: '1',
       NODE_OPTIONS: nodeOptions,
       NODE_NO_WARNINGS: '1',
+      PUPPETEER_SKIP_DOWNLOAD: 'true',
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
       PYTHONUNBUFFERED: '1',
-      UV_THREADPOOL_SIZE: '16',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: true,
@@ -504,7 +502,7 @@ export function stopProcess(botId: string): boolean {
 
   try {
     killProcessGroup(targetPid, 'SIGTERM');
-    setTimeout(() => {
+    const killTimer = setTimeout(() => {
       try {
         process.kill(targetPid, 0);
         killProcessGroup(targetPid, 'SIGKILL');
@@ -512,6 +510,8 @@ export function stopProcess(botId: string): boolean {
         // already exited
       }
     }, 4000);
+    if (typeof killTimer.unref === 'function') killTimer.unref();
+    bp.process.once('exit', () => clearTimeout(killTimer));
     return true;
   } catch {
     return false;
