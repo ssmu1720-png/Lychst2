@@ -61,7 +61,7 @@ import {
   stopProcessAndWait,
   waitForProcessStability,
 } from './server/processManager.ts';
-import { getEmailTransportStatus } from './server/emailService.ts';
+import { getEmailTransportStatus, sendDeploymentSuccessEmail } from './server/emailService.ts';
 import { TEMPLATE_BOTS } from './src/catalog/templateBots.ts';
 import {
   buildEmptyTelemetryHistory,
@@ -99,6 +99,7 @@ const TIER_MEMORY_MB: Record<ComputeTier, number> = {
 let state: PersistedState = loadState();
 const sseClients = new Map<express.Response, { userId: string | null; isAdmin: boolean }>();
 const pipelineAborts = new Map<string, AbortController>();
+const pipelineInFlight = new Map<string, Promise<void>>();
 const activeRestores = new Set<string>();
 
 function saveState(): void {
@@ -1014,10 +1015,96 @@ function abortPipeline(botId: string): void {
   }
 }
 
+function notifyDeployerOfSuccess(
+  dep: BotDeployment,
+  startCmd: string,
+  pid: number,
+  envVarCount: number
+): void {
+  const recipientEmail =
+    dep.ownerEmail?.trim() ||
+    (dep.ownerUserId ? getUserById(dep.ownerUserId)?.email?.trim() : '') ||
+    '';
+  if (!recipientEmail || !recipientEmail.includes('@')) {
+    return;
+  }
+
+  let planName = dep.planId || dep.settings.computeTier.toUpperCase();
+  try {
+    planName = getDeploymentPlan(dep.planId || 'plan_15d').name;
+  } catch {
+    // Fallback to stored planId/tier
+  }
+
+  const rawDashboard =
+    process.env.APP_URL?.trim() ||
+    process.env.PUBLIC_URL?.trim() ||
+    process.env.RENDER_EXTERNAL_URL?.trim() ||
+    (process.env.RAILWAY_STATIC_URL?.trim()
+      ? `https://${process.env.RAILWAY_STATIC_URL.trim().replace(/^https?:\/\//i, '')}`
+      : '') ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN?.trim()
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim().replace(/^https?:\/\//i, '')}`
+      : '') ||
+    getMeta('public_keepalive_origin') ||
+    '';
+
+  const dashboardUrl = /^https?:\/\//i.test(rawDashboard) ? rawDashboard : null;
+
+  void sendDeploymentSuccessEmail({
+    toEmail: recipientEmail,
+    botName: dep.name,
+    deploymentId: dep.id,
+    repoFullName: dep.repoFullName,
+    branch: dep.settings.branch,
+    commitSha: dep.commitSha,
+    platform: dep.platform,
+    framework: dep.framework,
+    runtime: dep.settings.runtime,
+    region: dep.settings.region,
+    computeTier: dep.settings.computeTier,
+    memoryLimitMb: dep.memoryLimitMb,
+    planName,
+    expiresAt: dep.expiresAt,
+    startCommand: startCmd,
+    pid,
+    envVarCount,
+    deployedAt: dep.lastDeployedAt || nowIso(),
+    dashboardUrl,
+  })
+    .then((result) => {
+      if (!state.deployments.some((d) => d.id === dep.id)) return;
+      if (result.ok) {
+        appendLog(dep, 'info', 'notify', `Deployment details sent to ${recipientEmail}.`);
+      } else {
+        appendLog(
+          dep,
+          'warn',
+          'notify',
+          `Deployment email skipped: ${result.error || 'Email transport unavailable.'}`
+        );
+      }
+    })
+    .catch(() => {
+      // Non-fatal notification failure
+    });
+}
+
 async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
+  const prevPipeline = pipelineInFlight.get(dep.id);
   abortPipeline(dep.id);
+
   const controller = new AbortController();
   pipelineAborts.set(dep.id, controller);
+
+  const runPromise = (async () => {
+    if (prevPipeline) {
+      await Promise.race([
+        prevPipeline.catch(() => undefined),
+        new Promise<void>((r) => setTimeout(r, 3000)),
+      ]);
+      if (controller.signal.aborted) return;
+    }
 
   ensureBotsDir();
   dep.status = 'building';
@@ -1260,6 +1347,7 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       dep.lastDeployedAt = nowIso();
       dep.uptimeSeconds = 2;
       appendLog(dep, 'success', 'runtime', `Bot process online (PID ${bp.pid}): ${startCmd}`);
+      notifyDeployerOfSuccess(dep, startCmd, bp.pid, Object.keys(envMap).length);
     } else if (isAutoRestarting(dep.id)) {
       dep.status = 'building';
       dep.desiredRunning = true;
@@ -1299,11 +1387,22 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
         // ignore temp cleanup failure
       }
     }
-    if (pipelineAborts.get(dep.id) === controller) {
+    const isLatestPipeline = pipelineAborts.get(dep.id) === controller;
+    if (isLatestPipeline) {
       pipelineAborts.delete(dep.id);
+      saveState();
+      broadcastDeployments();
     }
-    saveState();
-    broadcastDeployments();
+  }
+  })();
+
+  pipelineInFlight.set(dep.id, runPromise);
+  try {
+    await runPromise;
+  } finally {
+    if (pipelineInFlight.get(dep.id) === runPromise) {
+      pipelineInFlight.delete(dep.id);
+    }
   }
 }
 

@@ -895,3 +895,107 @@ export async function sendBrandedNotificationEmail(params: {
     };
   }
 }
+
+export interface DeploymentSuccessEmailParams {
+  toEmail: string;
+  botName: string;
+  deploymentId: string;
+  repoFullName: string;
+  branch: string;
+  commitSha: string;
+  platform: string;
+  framework: string;
+  runtime: string;
+  region: string;
+  computeTier: string;
+  memoryLimitMb: number;
+  planName: string;
+  expiresAt?: string | null;
+  startCommand: string;
+  pid: number;
+  envVarCount: number;
+  deployedAt: string;
+  dashboardUrl?: string | null;
+}
+
+export async function sendDeploymentSuccessEmail(
+  params: DeploymentSuccessEmailParams
+): Promise<{ ok: boolean; id?: string; provider?: string; error?: string }> {
+  const rows: Array<[string, string]> = [
+    ['Bot Name', params.botName],
+    ['Deployment ID', params.deploymentId],
+    ['Status', 'ONLINE · 24/7 Active'],
+    ['Platform / Framework', `${params.platform} · ${params.framework}`],
+    ['Repository', `${params.repoFullName} (${params.branch} @ ${params.commitSha})`],
+    ['Region / Tier', `${params.region} · ${params.computeTier.toUpperCase()} (${params.memoryLimitMb} MB RAM)`],
+    ['Hosting Plan', params.planName],
+    ['Plan Expires', params.expiresAt ? new Date(params.expiresAt).toUTCString() : 'Unlimited / No Expiry'],
+    ['Runtime / PID', `${params.runtime} · PID ${params.pid}`],
+    ['Start Command', params.startCommand],
+    ['Env Variables', `${params.envVarCount} configured (values redacted for security)`],
+    ['Deployed At', new Date(params.deployedAt).toUTCString()],
+  ];
+
+  const rowsHtml = rows
+    .map(
+      ([label, value]) => `
+        <tr>
+          <td style="padding:8px 10px; border-bottom:1px solid #2a0a10; font-size:12px; color:#94a3b8; white-space:nowrap; vertical-align:top;">${escapeHtml(label)}</td>
+          <td style="padding:8px 10px; border-bottom:1px solid #2a0a10; font-size:13px; color:#f8fafc; font-family:'IBM Plex Mono', ui-monospace, monospace; word-break:break-word;">${escapeHtml(value)}</td>
+        </tr>`
+    )
+    .join('');
+
+  const ctaHtml = params.dashboardUrl
+    ? `<div style="margin-top:22px; text-align:center;">
+         <a href="${escapeHtml(params.dashboardUrl)}" style="display:inline-block; background:#dc2626; color:#ffffff; text-decoration:none; font-size:13px; font-weight:700; padding:11px 22px; border-radius:6px;">Open Lyrihost Console</a>
+       </div>`
+    : '';
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#080305; color:#e2e8f0; padding:32px 24px; border:1px solid #450a0a; border-radius:10px; max-width:600px; margin:0 auto;">
+      <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#f87171; font-weight:700; margin-bottom:10px;">
+        LYRIHOST DEPLOYMENT LIVE
+      </div>
+      <h1 style="font-size:22px; color:#f8fafc; margin:0 0 10px 0;">${escapeHtml(params.botName)} is now online</h1>
+      <p style="font-size:14px; color:#cbd5e1; line-height:1.55; margin:0 0 20px 0;">
+        Your deployment completed cleanly and is running 24/7 under process supervision. Below are your live deployment details.
+      </p>
+      <table style="width:100%; border-collapse:collapse; background:#120509; border:1px solid #3f0d16; border-radius:8px; overflow:hidden;">
+        <tbody>
+          ${rowsHtml}
+        </tbody>
+      </table>
+      ${ctaHtml}
+      <hr style="border:none; border-top:1px solid #3f0d16; margin:24px 0 14px 0;" />
+      <p style="font-size:12px; color:#94a3b8; margin:0;">
+        Lyrihost Cloud Bot Hosting Platform · Need help? WhatsApp +254106625145 or sharksam004@gmail.com
+      </p>
+    </div>
+  `.trim();
+
+  const text = [
+    `LYRIHOST DEPLOYMENT LIVE — ${params.botName}`,
+    '',
+    ...rows.map(([k, v]) => `${k}: ${v}`),
+    ...(params.dashboardUrl ? ['', `Console: ${params.dashboardUrl}`] : []),
+    '',
+    'Lyrihost Cloud Bot Hosting Platform',
+  ].join('\n');
+
+  try {
+    const res = await sendRawResendEmail({
+      to: params.toEmail,
+      subject: `Deployment Live: ${params.botName} (${params.platform})`,
+      html,
+      text,
+    });
+    return { ok: true, id: res.id, provider: res.provider };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Email delivery failed',
+    };
+  }
+}
+

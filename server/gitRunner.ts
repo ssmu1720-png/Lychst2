@@ -428,23 +428,27 @@ export function runShellStep(
       return;
     }
 
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      NODE_ENV: 'development',
+      npm_config_omit: '',
+      ...GIT_HTTPS_REWRITE_ENV,
+      npm_config_yes: 'true',
+      npm_config_audit: 'false',
+      npm_config_fund: 'false',
+      npm_config_prefer_offline: 'false',
+      PUPPETEER_SKIP_DOWNLOAD: 'true',
+      SHARP_IGNORE_GLOBAL_LIBVIPS: '1',
+      PYTHONUNBUFFERED: '1',
+      PIP_DISABLE_PIP_VERSION_CHECK: '1',
+      ...env,
+    };
+    delete childEnv.npm_config_production;
+    delete childEnv.NPM_CONFIG_PRODUCTION;
+
     const child = spawn(command, {
       cwd,
-      env: {
-        ...process.env,
-        NODE_ENV: 'development',
-        npm_config_production: 'false',
-        ...GIT_HTTPS_REWRITE_ENV,
-        npm_config_yes: 'true',
-        npm_config_audit: 'false',
-        npm_config_fund: 'false',
-        npm_config_prefer_offline: 'false',
-        PUPPETEER_SKIP_DOWNLOAD: 'true',
-        SHARP_IGNORE_GLOBAL_LIBVIPS: '1',
-        PYTHONUNBUFFERED: '1',
-        PIP_DISABLE_PIP_VERSION_CHECK: '1',
-        ...env,
-      },
+      env: childEnv,
       shell: true,
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -560,6 +564,12 @@ export function buildEnvMap(envVars: EnvVarEntry[]): Record<string, string> {
   return map;
 }
 
+function formatEnvValue(val: string): string {
+  if (val === '') return '""';
+  if (/^[A-Za-z0-9_.,/:;@+~-]+$/.test(val)) return val;
+  return JSON.stringify(val);
+}
+
 function mergeEnvFile(filePath: string, map: Record<string, string>): void {
   const merged: Record<string, string> = {};
   if (fs.existsSync(filePath)) {
@@ -576,7 +586,7 @@ function mergeEnvFile(filePath: string, map: Record<string, string>): void {
   }
   for (const [k, v] of Object.entries(map)) {
     if (v !== '') {
-      merged[k] = JSON.stringify(v);
+      merged[k] = formatEnvValue(v);
     } else if (!(k in merged)) {
       merged[k] = '""';
     }
@@ -589,7 +599,7 @@ function mergeEnvFile(filePath: string, map: Record<string, string>): void {
 
 export function writeDotEnvFile(botDir: string, envVars: EnvVarEntry[]): void {
   const map = buildEnvMap(envVars);
-  const lines = Object.entries(map).map(([k, v]) => `${k}=${JSON.stringify(v)}`);
+  const lines = Object.entries(map).map(([k, v]) => `${k}=${formatEnvValue(v)}`);
   if (lines.length > 0) {
     fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n', 'utf-8');
   }

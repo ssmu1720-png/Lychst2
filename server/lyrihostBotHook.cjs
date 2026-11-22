@@ -4,6 +4,14 @@ const fs = require('node:fs');
 const Module = require('node:module');
 const path = require('node:path');
 
+const entryScript = String((process.argv && process.argv[1]) || '');
+if (
+  /(?:^|[\\/])(?:npm|npx|yarn|pnpm|corepack)(?:-cli)?\.[cm]?js$/i.test(entryScript) ||
+  /[\\/](?:npm|yarn|pnpm|corepack)[\\/]bin[\\/]/i.test(entryScript)
+) {
+  return;
+}
+
 /**
  * 1. Runtime FS guard for WhatsApp MD / Baileys bots that call rmdir/rmdirSync
  * on active non-empty session directories and crash with ENOTEMPTY.
@@ -307,19 +315,27 @@ function wrapVersionFetcher(origFn) {
 function refreshWaVersionFromModule(loaded) {
   if (versionRefreshStarted || !loaded || typeof loaded !== 'object') return;
   versionRefreshStarted = true;
-  if (typeof loaded.fetchLatestWaWebVersion === 'function') {
-    Promise.resolve(loaded.fetchLatestWaWebVersion({}))
-      .then((res) => {
-        if (res && Array.isArray(res.version)) updateCachedWaVersion(res.version);
-      })
-      .catch(() => {});
-  }
-  if (typeof loaded.fetchLatestBaileysVersion === 'function') {
-    Promise.resolve(loaded.fetchLatestBaileysVersion())
-      .then((res) => {
-        if (res && Array.isArray(res.version)) updateCachedWaVersion(res.version);
-      })
-      .catch(() => {});
+  try {
+    const fetchWa = loaded.fetchLatestWaWebVersion;
+    if (typeof fetchWa === 'function') {
+      Promise.resolve()
+        .then(() => fetchWa({}))
+        .then((res) => {
+          if (res && Array.isArray(res.version)) updateCachedWaVersion(res.version);
+        })
+        .catch(() => {});
+    }
+    const fetchBaileys = loaded.fetchLatestBaileysVersion;
+    if (typeof fetchBaileys === 'function') {
+      Promise.resolve()
+        .then(() => fetchBaileys())
+        .then((res) => {
+          if (res && Array.isArray(res.version)) updateCachedWaVersion(res.version);
+        })
+        .catch(() => {});
+    }
+  } catch {
+    // Ignore getter/proxy errors from partially initialized modules
   }
 }
 
@@ -1123,8 +1139,16 @@ if (typeof Module.registerHooks === 'function') {
               'async function __lyrihostOrigFetchLatestBaileysVersion'
             );
             patched = patched.replace(
+              /export\s+(?:const|let|var)\s+fetchLatestBaileysVersion\s*=/,
+              'const __lyrihostOrigFetchLatestBaileysVersion ='
+            );
+            patched = patched.replace(
               /export\s+(?:async\s+)?function\s+fetchLatestWaWebVersion\b/,
               'async function __lyrihostOrigFetchLatestWaWebVersion'
+            );
+            patched = patched.replace(
+              /export\s+(?:const|let|var)\s+fetchLatestWaWebVersion\s*=/,
+              'const __lyrihostOrigFetchLatestWaWebVersion ='
             );
             if (patched !== code) {
               if (patched.includes('__lyrihostOrigFetchLatestBaileysVersion')) {
@@ -1145,6 +1169,140 @@ if (typeof Module.registerHooks === 'function') {
   }
 }
 
+const BAILEYS_EXPORT_WRAPPERS = new Map([
+  ['fetchLatestWaWebVersion', wrapVersionFetcher],
+  ['fetchLatestBaileysVersion', wrapVersionFetcher],
+  ['default', wrapSocketFactory],
+  ['makeWASocket', wrapSocketFactory],
+]);
+
+const wrappedModuleFacades = new WeakMap();
+
+function safePatchModuleExport(target, prop, wrapperFn) {
+  try {
+    const desc = Object.getOwnPropertyDescriptor(target, prop);
+    if (!desc) {
+      let currentVal;
+      try {
+        currentVal = target[prop];
+      } catch {
+        return true;
+      }
+      if (typeof currentVal !== 'function') return true;
+      if (!Object.isExtensible(target)) return false;
+      Object.defineProperty(target, prop, {
+        value: wrapperFn(currentVal),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return true;
+    }
+
+    if (typeof desc.get === 'function') {
+      if (desc.get.__lyrihostGetterWrapped) return true;
+      if (!desc.configurable) return false;
+      const origGet = desc.get;
+      let cachedRaw;
+      let cachedWrapped;
+      const wrappedGet = function lyrihostWrappedGetter() {
+        const raw = origGet.call(this);
+        if (raw !== cachedRaw) {
+          cachedRaw = raw;
+          cachedWrapped = typeof raw === 'function' ? wrapperFn(raw) : raw;
+        }
+        return cachedWrapped;
+      };
+      wrappedGet.__lyrihostGetterWrapped = true;
+      const nextDesc = {
+        enumerable: desc.enumerable,
+        configurable: true,
+        get: wrappedGet,
+      };
+      if (typeof desc.set === 'function') nextDesc.set = desc.set;
+      Object.defineProperty(target, prop, nextDesc);
+      return true;
+    }
+
+    if (typeof desc.value !== 'function') return true;
+    if (desc.writable) {
+      target[prop] = wrapperFn(desc.value);
+      return true;
+    }
+    if (desc.configurable) {
+      Object.defineProperty(target, prop, {
+        value: wrapperFn(desc.value),
+        writable: false,
+        enumerable: desc.enumerable,
+        configurable: true,
+      });
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function getWrappedModuleFacade(loaded) {
+  if (wrappedModuleFacades.has(loaded)) {
+    return wrappedModuleFacades.get(loaded);
+  }
+  try {
+    const proto = Object.getPrototypeOf(loaded);
+    const facade = proto === null ? Object.create(null) : {};
+    for (const key of Reflect.ownKeys(loaded)) {
+      const desc = Object.getOwnPropertyDescriptor(loaded, key);
+      if (!desc) continue;
+      const wrapperFn = typeof key === 'string' ? BAILEYS_EXPORT_WRAPPERS.get(key) : null;
+
+      if (wrapperFn && typeof desc.get === 'function') {
+        const origGet = desc.get;
+        let cachedRaw;
+        let cachedWrapped;
+        Object.defineProperty(facade, key, {
+          enumerable: desc.enumerable,
+          configurable: true,
+          get() {
+            const raw = origGet.call(loaded);
+            if (raw !== cachedRaw) {
+              cachedRaw = raw;
+              cachedWrapped = typeof raw === 'function' ? wrapperFn(raw) : raw;
+            }
+            return cachedWrapped;
+          },
+          ...(typeof desc.set === 'function' ? { set: desc.set.bind(loaded) } : {}),
+        });
+      } else if (wrapperFn && typeof desc.value === 'function') {
+        Object.defineProperty(facade, key, {
+          enumerable: desc.enumerable,
+          configurable: true,
+          writable: Boolean(desc.writable),
+          value: wrapperFn(desc.value),
+        });
+      } else if (typeof desc.get === 'function') {
+        Object.defineProperty(facade, key, {
+          enumerable: desc.enumerable,
+          configurable: true,
+          get: () => loaded[key],
+          ...(typeof desc.set === 'function' ? { set: desc.set.bind(loaded) } : {}),
+        });
+      } else {
+        Object.defineProperty(facade, key, {
+          enumerable: desc.enumerable,
+          configurable: true,
+          writable: Boolean(desc.writable),
+          value: desc.value,
+        });
+      }
+    }
+    wrappedModuleFacades.set(loaded, facade);
+    return facade;
+  } catch {
+    return loaded;
+  }
+}
+
 const origModuleLoad = Module._load;
 Module._load = function patchedModuleLoad(request, parent, isMain) {
   const loaded = origModuleLoad.apply(this, arguments);
@@ -1155,17 +1313,14 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
     typeof loaded === 'object'
   ) {
     refreshWaVersionFromModule(loaded);
-    if (typeof loaded.fetchLatestWaWebVersion === 'function') {
-      loaded.fetchLatestWaWebVersion = wrapVersionFetcher(loaded.fetchLatestWaWebVersion);
+    let allPatchedInPlace = true;
+    for (const [prop, wrapperFn] of BAILEYS_EXPORT_WRAPPERS.entries()) {
+      if (!safePatchModuleExport(loaded, prop, wrapperFn)) {
+        allPatchedInPlace = false;
+      }
     }
-    if (typeof loaded.fetchLatestBaileysVersion === 'function') {
-      loaded.fetchLatestBaileysVersion = wrapVersionFetcher(loaded.fetchLatestBaileysVersion);
-    }
-    if (typeof loaded.default === 'function') {
-      loaded.default = wrapSocketFactory(loaded.default);
-    }
-    if (typeof loaded.makeWASocket === 'function') {
-      loaded.makeWASocket = wrapSocketFactory(loaded.makeWASocket);
+    if (!allPatchedInPlace) {
+      return getWrappedModuleFacade(loaded);
     }
   }
   return loaded;
