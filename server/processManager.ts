@@ -269,6 +269,34 @@ export function waitForProcessStability(
   });
 }
 
+export async function stopProcessAndWait(
+  botId: string,
+  dirKey?: string | number,
+  timeoutMs = 1500
+): Promise<void> {
+  const existing = runningProcesses.get(botId);
+  const hadPid = existing?.pid;
+  stopProcess(botId);
+  if (hadPid && hadPid > 0) {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        processEmitter.off(`exit:${botId}`, done);
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      processEmitter.once(`exit:${botId}`, done);
+    });
+  }
+  const botDir = getBotDir(dirKey ?? botId);
+  if (fs.existsSync(botDir)) {
+    killProcessesInDirectory(botDir);
+  }
+}
+
 export function startProcess(
   botId: string,
   command: string,
@@ -285,10 +313,14 @@ export function startProcess(
     throw new Error('Start command is empty.');
   }
 
+  if (runningProcesses.has(botId)) {
+    stopProcess(botId);
+  }
+  killProcessesInDirectory(botDir);
   intentionallyStopped.delete(botId);
   clearPendingRestartTimer(botId);
 
-  const heapLimitMb = Math.max(512, Math.min(2048, options.memoryLimitMb || 512));
+  const heapLimitMb = Math.max(768, Math.min(2048, options.memoryLimitMb || 768));
   const hookPath = path.resolve(process.cwd(), 'server', 'lyrihostBotHook.cjs');
   const nodeOptions = fs.existsSync(hookPath)
     ? `--require ${JSON.stringify(hookPath)} --max-old-space-size=${heapLimitMb}`
@@ -357,6 +389,11 @@ export function startProcess(
     options.restartPolicy ?? (options.autoRestart === false ? 'never' : 'always');
 
   child.on('exit', (code) => {
+    const current = runningProcesses.get(botId);
+    if (current && current.process !== child) {
+      return;
+    }
+
     const wasManualStop = intentionallyStopped.has(botId);
     intentionallyStopped.delete(botId);
     runningProcesses.delete(botId);
@@ -434,6 +471,10 @@ export function startProcess(
   });
 
   child.on('error', (err) => {
+    const current = runningProcesses.get(botId);
+    if (current && current.process !== child) {
+      return;
+    }
     intentionallyStopped.delete(botId);
     clearPendingRestartTimer(botId);
     emitOutput(Buffer.from(`\r\n[ERROR] ${err.message}\r\n`));

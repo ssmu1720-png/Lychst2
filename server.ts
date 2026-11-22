@@ -58,6 +58,7 @@ import {
   setProcessExitCallback,
   startProcess,
   stopProcess,
+  stopProcessAndWait,
   waitForProcessStability,
 } from './server/processManager.ts';
 import { getEmailTransportStatus } from './server/emailService.ts';
@@ -98,6 +99,7 @@ const TIER_MEMORY_MB: Record<ComputeTier, number> = {
 let state: PersistedState = loadState();
 const sseClients = new Map<express.Response, { userId: string | null; isAdmin: boolean }>();
 const pipelineAborts = new Map<string, AbortController>();
+const activeRestores = new Set<string>();
 
 function saveState(): void {
   saveStateToDisk(state);
@@ -194,7 +196,13 @@ async function recoverBotProcess(dep: BotDeployment): Promise<void> {
   if (now - last < 10000) return;
   watchdogLastAttempt.set(dep.id, now);
 
-  if (isRunning(dep.id, dep.pid) || isAutoRestarting(dep.id) || pipelineAborts.has(dep.id)) {
+  if (
+    dep.status === 'building' ||
+    isRunning(dep.id, dep.pid) ||
+    isAutoRestarting(dep.id) ||
+    pipelineAborts.has(dep.id) ||
+    activeRestores.has(dep.id)
+  ) {
     return;
   }
 
@@ -390,7 +398,8 @@ setInterval(() => {
         (dep.status === 'stopped' || dep.status === 'failed') &&
         !isRunning(dep.id, dep.pid) &&
         !isAutoRestarting(dep.id) &&
-        !pipelineAborts.has(dep.id)
+        !pipelineAborts.has(dep.id) &&
+        !activeRestores.has(dep.id)
       ) {
         void recoverBotProcess(dep);
       }
@@ -1011,10 +1020,6 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
   pipelineAborts.set(dep.id, controller);
 
   ensureBotsDir();
-  if (isRunning(dep.id, dep.pid)) {
-    stopProcess(dep.id);
-  }
-
   dep.status = 'building';
   dep.pid = null;
   dep.cpuPercent = 0;
@@ -1025,6 +1030,8 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
   dep.networkKbps = 0;
   dep.healthScore = 0;
   dep.memoryLimitMb = TIER_MEMORY_MB[dep.settings.computeTier] || 512;
+  saveState();
+  broadcastDeployments();
 
   const botDir = getBotDir(dep.id);
   const envMap = buildEnvMap(dep.settings.envVars);
@@ -1035,13 +1042,72 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
     return !current || current.status === 'stopped';
   };
 
+  let preservedDataBackupDir: string | null = null;
+  let restoredDataCount = 0;
+
   try {
+    // Step 0: Stop any existing process/restart timer cleanly before modifying files or starting a new socket
+    await stopProcessAndWait(dep.id, dep.id, 1500);
+    if (isAborted()) return;
+
     appendLog(
       dep,
       'info',
       'init',
       `Starting real deployment pipeline for ${dep.repoFullName} (branch: ${dep.settings.branch}, region: ${dep.settings.region})`
     );
+
+    // Preserve persistent bot databases, SQLite stores, startup cooldown state, and QR-paired sessions across redeploys
+    if (fs.existsSync(botDir)) {
+      const backupDir = path.join(path.dirname(botDir), `.tmp_data_${dep.id}_${Date.now()}`);
+      const ensureBackupDir = () => {
+        if (!preservedDataBackupDir) {
+          fs.mkdirSync(backupDir, { recursive: true });
+          preservedDataBackupDir = backupDir;
+        }
+      };
+
+      const persistentDataDirs = ['database', 'data', 'db', 'storage', 'sessions'];
+      for (const dirName of persistentDataDirs) {
+        const srcDir = path.join(botDir, dirName);
+        if (fs.existsSync(srcDir) && fs.statSync(srcDir).isDirectory()) {
+          ensureBackupDir();
+          fs.cpSync(srcDir, path.join(backupDir, dirName), {
+            recursive: true,
+            filter: (srcPath) => !/\.(?:js|ts|mjs|cjs|map)$/i.test(srcPath),
+          });
+          restoredDataCount++;
+        }
+      }
+
+      if (dep.platform === 'whatsapp' && !envMap.SESSION_ID && !envMap.SESSION) {
+        for (const candidate of ['session', 'auth_info_baileys']) {
+          const candidatePath = path.join(botDir, candidate);
+          if (fs.existsSync(path.join(candidatePath, 'creds.json'))) {
+            ensureBackupDir();
+            fs.cpSync(candidatePath, path.join(backupDir, candidate), { recursive: true });
+            restoredDataCount++;
+          }
+        }
+      }
+
+      try {
+        const rootEntries = fs.readdirSync(botDir, { withFileTypes: true });
+        for (const entry of rootEntries) {
+          if (!entry.isFile()) continue;
+          if (
+            /^(?:store\.json|database\.json|baileys_store\.json|\.lyrihost_startup_state\.json)$/i.test(entry.name) ||
+            /\.(?:db|db-wal|db-shm|sqlite|sqlite3|sqlite-wal|sqlite-shm)$/i.test(entry.name)
+          ) {
+            ensureBackupDir();
+            fs.copyFileSync(path.join(botDir, entry.name), path.join(backupDir, entry.name));
+            restoredDataCount++;
+          }
+        }
+      } catch {
+        // non-fatal root scan failure
+      }
+    }
 
     // Step 1: Real git clone
     const cloneRes = await cloneRepository(dep.repoUrl, botDir, {
@@ -1057,6 +1123,16 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       appendLog(dep, 'error', 'clone', `Git clone failed: ${cloneRes.output.slice(-500)}`);
       return;
     }
+
+    if (preservedDataBackupDir && fs.existsSync(preservedDataBackupDir) && restoredDataCount > 0) {
+      try {
+        fs.cpSync(preservedDataBackupDir, botDir, { recursive: true, force: true });
+        appendLog(dep, 'info', 'clone', `Restored ${restoredDataCount} persistent storage/session item(s) across redeploy.`);
+      } catch {
+        // non-fatal if backup copy fails
+      }
+    }
+
     const headInfo = await getRepoHeadInfo(botDir);
     dep.commitSha = headInfo.commitSha;
     dep.settings.branch = headInfo.branch;
@@ -1158,7 +1234,10 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       appendLog(dep, 'success', 'build', 'Build completed cleanly.');
     }
 
-    // Step 5: Spawn real child process & verify startup stability
+    // Re-sync runtime env/JSON config immediately before launch in case install/build touched files
+    writeDotEnvFile(botDir, dep.settings.envVars);
+
+    // Step 5: Spawn single clean child process & verify startup stability
     const startCmd = resolved.startCommand.trim() || 'npm start';
     appendLog(dep, 'info', 'runtime', `Launching process: ${startCmd}`);
     const bp = startProcess(dep.id, startCmd, {
@@ -1168,15 +1247,18 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       env: envMap,
     });
 
-    const stability = await waitForProcessStability(dep.id, 1200);
-    if (isAborted()) return;
+    const stability = await waitForProcessStability(dep.id, 2200);
+    if (isAborted()) {
+      stopProcess(dep.id);
+      return;
+    }
 
     if (stability.alive) {
       dep.status = 'online';
       dep.desiredRunning = true;
       dep.pid = bp.pid;
       dep.lastDeployedAt = nowIso();
-      dep.uptimeSeconds = 1;
+      dep.uptimeSeconds = 2;
       appendLog(dep, 'success', 'runtime', `Bot process online (PID ${bp.pid}): ${startCmd}`);
     } else if (isAutoRestarting(dep.id)) {
       dep.status = 'building';
@@ -1210,9 +1292,18 @@ async function triggerDeploymentPipeline(dep: BotDeployment): Promise<void> {
       );
     }
   } finally {
+    if (preservedDataBackupDir && fs.existsSync(preservedDataBackupDir)) {
+      try {
+        fs.rmSync(preservedDataBackupDir, { recursive: true, force: true });
+      } catch {
+        // ignore temp cleanup failure
+      }
+    }
     if (pipelineAborts.get(dep.id) === controller) {
       pipelineAborts.delete(dep.id);
     }
+    saveState();
+    broadcastDeployments();
   }
 }
 
@@ -1228,8 +1319,10 @@ async function startupBotRestore(): Promise<void> {
       const notExpired = !dep.expiresAt || Date.parse(dep.expiresAt) > Date.now();
       if (wasActive && notExpired && dep.settings.restartPolicy !== 'never') {
         resumeIds.add(dep.id);
-      }
-      if (dep.status === 'building' || dep.status === 'scanning' || (dep.status === 'online' && !isRunning(dep.id, dep.pid))) {
+        activeRestores.add(dep.id);
+        dep.status = 'building';
+        dep.pid = null;
+      } else if (dep.status === 'building' || dep.status === 'scanning' || (dep.status === 'online' && !isRunning(dep.id, dep.pid))) {
         dep.status = 'stopped';
         dep.pid = null;
         dep.cpuPercent = 0;
@@ -1238,31 +1331,42 @@ async function startupBotRestore(): Promise<void> {
       }
     }
     saveState();
+    broadcastDeployments();
 
     for (const dep of state.deployments) {
-      const botDir = getBotDir(dep.id);
-      const needsClone = !fs.existsSync(botDir);
-      const needsNodeInstall =
-        fs.existsSync(botDir) &&
-        fs.existsSync(path.join(botDir, 'package.json')) &&
-        !fs.existsSync(path.join(botDir, 'node_modules'));
+      try {
+        const botDir = getBotDir(dep.id);
+        const needsClone = !fs.existsSync(botDir);
+        const needsNodeInstall =
+          fs.existsSync(botDir) &&
+          fs.existsSync(path.join(botDir, 'package.json')) &&
+          !fs.existsSync(path.join(botDir, 'node_modules'));
 
-      if (needsClone) {
-        const token = dep.gitToken || state.githubToken || process.env.GITHUB_TOKEN || undefined;
-        const cloneRes = await cloneRepository(dep.repoUrl, botDir, {
-          branch: dep.settings.branch,
-          gitToken: token,
-        });
-        if (cloneRes.ok) {
-          if (dep.platform === 'whatsapp') {
-            fs.mkdirSync(path.join(botDir, 'session'), { recursive: true });
+        if (needsClone) {
+          const token = dep.gitToken || state.githubToken || process.env.GITHUB_TOKEN || undefined;
+          const cloneRes = await cloneRepository(dep.repoUrl, botDir, {
+            branch: dep.settings.branch,
+            gitToken: token,
+          });
+          if (cloneRes.ok) {
+            if (dep.platform === 'whatsapp') {
+              fs.mkdirSync(path.join(botDir, 'session'), { recursive: true });
+            }
+            writeDotEnvFile(botDir, dep.settings.envVars);
+            const resolved = resolveDeploymentCommands(botDir, dep.settings);
+            dep.settings.installCommand = resolved.installCommand;
+            dep.settings.buildCommand = resolved.buildCommand;
+            dep.settings.startCommand = resolved.startCommand;
+            dep.settings.runtime = resolved.runtime;
+            if (resolved.installCommand) {
+              await runShellStep(resolved.installCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
+            }
+            if (resolved.buildCommand) {
+              await runShellStep(resolved.buildCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
+            }
           }
-          writeDotEnvFile(botDir, dep.settings.envVars);
+        } else if (needsNodeInstall && resumeIds.has(dep.id)) {
           const resolved = resolveDeploymentCommands(botDir, dep.settings);
-          dep.settings.installCommand = resolved.installCommand;
-          dep.settings.buildCommand = resolved.buildCommand;
-          dep.settings.startCommand = resolved.startCommand;
-          dep.settings.runtime = resolved.runtime;
           if (resolved.installCommand) {
             await runShellStep(resolved.installCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
           }
@@ -1270,47 +1374,47 @@ async function startupBotRestore(): Promise<void> {
             await runShellStep(resolved.buildCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
           }
         }
-      } else if (needsNodeInstall && resumeIds.has(dep.id)) {
-        const resolved = resolveDeploymentCommands(botDir, dep.settings);
-        if (resolved.installCommand) {
-          await runShellStep(resolved.installCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
-        }
-        if (resolved.buildCommand) {
-          await runShellStep(resolved.buildCommand, botDir, buildEnvMap(dep.settings.envVars), 300000);
-        }
-      }
 
-      if (resumeIds.has(dep.id) && fs.existsSync(botDir)) {
-        try {
-          writeDotEnvFile(botDir, dep.settings.envVars);
-          const resolved = resolveDeploymentCommands(botDir, dep.settings);
-          const bp = startProcess(dep.id, resolved.startCommand, {
-            numericId: dep.numericId,
-            restartPolicy: dep.settings.restartPolicy,
-            memoryLimitMb: dep.memoryLimitMb,
-            env: buildEnvMap(dep.settings.envVars),
-          });
-          const stability = await waitForProcessStability(dep.id, 1000);
-          if (stability.alive) {
-            dep.status = 'online';
-            dep.desiredRunning = true;
-            dep.pid = bp.pid;
-            dep.uptimeSeconds = 1;
-            pushDeploymentLog(dep, 'info', 'runtime', `Restored and started bot process after server boot (PID ${bp.pid}).`);
+        if (resumeIds.has(dep.id) && fs.existsSync(botDir)) {
+          try {
+            writeDotEnvFile(botDir, dep.settings.envVars);
+            const resolved = resolveDeploymentCommands(botDir, dep.settings);
+            const bp = startProcess(dep.id, resolved.startCommand, {
+              numericId: dep.numericId,
+              restartPolicy: dep.settings.restartPolicy,
+              memoryLimitMb: dep.memoryLimitMb,
+              env: buildEnvMap(dep.settings.envVars),
+            });
+            const stability = await waitForProcessStability(dep.id, 1500);
+            if (stability.alive) {
+              dep.status = 'online';
+              dep.desiredRunning = true;
+              dep.pid = bp.pid;
+              dep.uptimeSeconds = 1;
+              pushDeploymentLog(dep, 'info', 'runtime', `Restored and started bot process after server boot (PID ${bp.pid}).`);
+            } else if (!isAutoRestarting(dep.id)) {
+              dep.status = 'stopped';
+              dep.pid = null;
+            }
+          } catch (err) {
+            dep.status = 'failed';
+            dep.pid = null;
+            pushDeploymentLog(
+              dep,
+              'error',
+              'runtime',
+              `Auto-restore failed on boot: ${err instanceof Error ? err.message : 'Unknown error'}`
+            );
           }
-        } catch (err) {
-          pushDeploymentLog(
-            dep,
-            'error',
-            'runtime',
-            `Auto-restore failed on boot: ${err instanceof Error ? err.message : 'Unknown error'}`
-          );
         }
+      } finally {
+        activeRestores.delete(dep.id);
       }
     }
     saveState();
     broadcastDeployments();
   } catch (err) {
+    activeRestores.clear();
     console.error('Startup bot restore error:', err);
   }
 }
@@ -1915,10 +2019,15 @@ async function startServer() {
       const hasNodeModulesOrPy =
         fs.existsSync(botDir) &&
         (!fs.existsSync(path.join(botDir, 'package.json')) || fs.existsSync(path.join(botDir, 'node_modules')));
+      if (pipelineAborts.has(dep.id) || activeRestores.has(dep.id)) {
+        res.json(dep);
+        return;
+      }
       if (!fs.existsSync(botDir) || !hasNodeModulesOrPy) {
         void triggerDeploymentPipeline(dep);
       } else if (!isRunning(dep.id, dep.pid)) {
         try {
+          await stopProcessAndWait(dep.id, dep.id, 1000);
           writeDotEnvFile(botDir, dep.settings.envVars);
           const resolved = resolveDeploymentCommands(botDir, dep.settings);
           dep.settings.startCommand = resolved.startCommand;
@@ -1928,7 +2037,7 @@ async function startServer() {
             memoryLimitMb: dep.memoryLimitMb,
             env: buildEnvMap(dep.settings.envVars),
           });
-          const stability = await waitForProcessStability(dep.id, 1000);
+          const stability = await waitForProcessStability(dep.id, 1500);
           if (stability.alive) {
             dep.status = 'online';
             dep.desiredRunning = true;
@@ -1983,8 +2092,7 @@ async function startServer() {
         void triggerDeploymentPipeline(dep);
       } else {
         abortPipeline(dep.id);
-        stopProcess(dep.id);
-        await new Promise((r) => setTimeout(r, 400));
+        await stopProcessAndWait(dep.id, dep.id, 1500);
         const botDir = getBotDir(dep.id);
         const hasNodeModulesOrPy =
           fs.existsSync(botDir) &&

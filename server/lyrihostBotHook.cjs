@@ -147,61 +147,161 @@ function logTransientNotice(err) {
   console.warn(`[runtime] Suppressed transient WhatsApp socket retry (${code ? `${code} ` : ''}${msg}).`);
 }
 
-let cachedWaVersion = [2, 3000, 1055794947];
+let cachedWaVersion = [2, 3000, 1055798384];
 let versionRefreshStarted = false;
 let swRefreshTimerStarted = false;
 let loggedVersionUpgrade = false;
+let activeRefreshPromise = null;
+let lastVersionFetchAt = 0;
 
-function refreshWaVersionFromWhatsAppWeb() {
-  try {
-    const https = require('node:https');
-    const req = https.get(
-      'https://web.whatsapp.com/sw.js',
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        },
-        timeout: 4500,
-      },
-      (res) => {
+function compareWaVersions(a, b) {
+  const va = Array.isArray(a) ? a.map((n) => Number(n) || 0) : [0, 0, 0];
+  const vb = Array.isArray(b) ? b.map((n) => Number(n) || 0) : [0, 0, 0];
+  const len = Math.max(va.length, vb.length, 3);
+  for (let i = 0; i < len; i++) {
+    const da = va[i] || 0;
+    const db = vb[i] || 0;
+    if (da !== db) return da - db;
+  }
+  return 0;
+}
+
+function updateCachedWaVersion(candidate) {
+  if (!Array.isArray(candidate) || candidate.length < 3) return;
+  const normalized = [Number(candidate[0]) || 0, Number(candidate[1]) || 0, Number(candidate[2]) || 0];
+  if (normalized[0] >= 2 && normalized[2] > 0 && compareWaVersions(normalized, cachedWaVersion) > 0) {
+    cachedWaVersion = normalized;
+  }
+}
+
+function fetchHttpsText(url, headers, timeoutMs) {
+  return new Promise((resolve) => {
+    try {
+      const https = require('node:https');
+      const req = https.get(url, { headers, timeout: timeoutMs }, (res) => {
         if (res.statusCode !== 200) {
           res.resume();
+          resolve(null);
           return;
         }
         let body = '';
         res.on('data', (chunk) => {
-          if (body.length < 250000) body += chunk.toString('utf8');
+          if (body.length < 300000) body += chunk.toString('utf8');
         });
-        res.on('end', () => {
-          const match =
-            body.match(/client_revision\\?":(\d{8,12})/) ||
-            body.match(/"client_revision":(\d{8,12})/);
-          if (match) {
-            const rev = Number.parseInt(match[1], 10);
-            if (Number.isFinite(rev) && rev > cachedWaVersion[2]) {
-              cachedWaVersion = [2, 3000, rev];
-            }
-          }
-        });
-      }
-    );
-    req.on('error', () => {});
-    req.on('timeout', () => {
-      try {
-        req.destroy();
-      } catch {}
-    });
-  } catch {
-    // ignore background fetch error
-  }
+        res.on('end', () => resolve(body));
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => {
+        try {
+          req.destroy();
+        } catch {}
+        resolve(null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
 }
 
-refreshWaVersionFromWhatsAppWeb();
+function refreshWaVersionFromWhatsAppWeb(force = false) {
+  const now = Date.now();
+  if (!force && activeRefreshPromise) return activeRefreshPromise;
+  if (!force && now - lastVersionFetchAt < 60000) {
+    return Promise.resolve(cachedWaVersion);
+  }
+  lastVersionFetchAt = now;
+
+  activeRefreshPromise = (async () => {
+    try {
+      const swBody = await fetchHttpsText(
+        'https://web.whatsapp.com/sw.js',
+        {
+          'sec-fetch-site': 'none',
+          'sec-fetch-mode': 'no-cors',
+          'User-Agent':
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+        4000
+      );
+      if (swBody) {
+        const match =
+          swBody.match(/client_revision\\?":(\d{8,12})/) ||
+          swBody.match(/"client_revision":(\d{8,12})/);
+        if (match) {
+          const rev = Number.parseInt(match[1], 10);
+          if (Number.isFinite(rev) && rev > 0) {
+            updateCachedWaVersion([2, 3000, rev]);
+            return cachedWaVersion;
+          }
+        }
+      }
+
+      // Secondary fallback from wppconnect-team/wa-version metadata
+      const waJson = await fetchHttpsText(
+        'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/versions.json',
+        { 'User-Agent': 'Node.js' },
+        4000
+      );
+      if (waJson) {
+        const parsed = JSON.parse(waJson);
+        const versions = Array.isArray(parsed && parsed.versions) ? parsed.versions : [];
+        for (let i = versions.length - 1; i >= 0; i--) {
+          const entry = versions[i];
+          const verStr = entry && typeof entry.version === 'string' ? entry.version : '';
+          const parts = verStr.split('.').map((n) => Number.parseInt(n, 10));
+          if (parts.length >= 3 && parts.slice(0, 3).every((n) => Number.isFinite(n))) {
+            updateCachedWaVersion(parts.slice(0, 3));
+            break;
+          }
+        }
+      }
+    } catch {
+      // ignore background fetch error
+    } finally {
+      activeRefreshPromise = null;
+    }
+    return cachedWaVersion;
+  })();
+
+  return activeRefreshPromise;
+}
+
+function ensureFreshWaVersion(maxWaitMs = 2500) {
+  const p = refreshWaVersionFromWhatsAppWeb(false);
+  return withFastTimeout(p, maxWaitMs).then(() => cachedWaVersion);
+}
+
+refreshWaVersionFromWhatsAppWeb(true);
 if (!swRefreshTimerStarted) {
   swRefreshTimerStarted = true;
-  const swRefreshTimer = setInterval(refreshWaVersionFromWhatsAppWeb, 6 * 60 * 60 * 1000);
+  const swRefreshTimer = setInterval(() => refreshWaVersionFromWhatsAppWeb(true), 6 * 60 * 60 * 1000);
   if (typeof swRefreshTimer.unref === 'function') swRefreshTimer.unref();
+}
+
+function wrapVersionFetcher(origFn) {
+  if (typeof origFn !== 'function' || origFn.__lyrihostVersionWrapped) return origFn;
+  const wrapped = async function lyrihostWrappedVersionFetcher(...args) {
+    const [freshRes, origRes] = await Promise.all([
+      ensureFreshWaVersion(2500).catch(() => cachedWaVersion),
+      Promise.resolve()
+        .then(() => origFn.apply(this, args))
+        .catch(() => null),
+    ]);
+    if (origRes && Array.isArray(origRes.version) && origRes.version.length >= 3) {
+      updateCachedWaVersion(origRes.version);
+    }
+    const best =
+      Array.isArray(freshRes) && compareWaVersions(freshRes, cachedWaVersion) > 0
+        ? freshRes
+        : cachedWaVersion;
+    return {
+      ...(origRes && typeof origRes === 'object' ? origRes : {}),
+      version: [...best],
+      isLatest: true,
+    };
+  };
+  wrapped.__lyrihostVersionWrapped = true;
+  return wrapped;
 }
 
 function refreshWaVersionFromModule(loaded) {
@@ -210,17 +310,14 @@ function refreshWaVersionFromModule(loaded) {
   if (typeof loaded.fetchLatestWaWebVersion === 'function') {
     Promise.resolve(loaded.fetchLatestWaWebVersion({}))
       .then((res) => {
-        if (res && Array.isArray(res.version) && res.version.length === 3 && Number(res.version[2]) > cachedWaVersion[2]) {
-          cachedWaVersion = res.version;
-        }
+        if (res && Array.isArray(res.version)) updateCachedWaVersion(res.version);
       })
       .catch(() => {});
-  } else if (typeof loaded.fetchLatestBaileysVersion === 'function') {
+  }
+  if (typeof loaded.fetchLatestBaileysVersion === 'function') {
     Promise.resolve(loaded.fetchLatestBaileysVersion())
       .then((res) => {
-        if (res && Array.isArray(res.version) && res.version.length === 3 && Number(res.version[2]) > cachedWaVersion[2]) {
-          cachedWaVersion = res.version;
-        }
+        if (res && Array.isArray(res.version)) updateCachedWaVersion(res.version);
       })
       .catch(() => {});
   }
@@ -228,7 +325,7 @@ function refreshWaVersionFromModule(loaded) {
 
 function isStaleWaVersion(v) {
   if (!Array.isArray(v) || v.length < 3) return true;
-  return v[0] === 2 && v[1] === 3000 && Number(v[2]) < cachedWaVersion[2];
+  return compareWaVersions(v, cachedWaVersion) < 0;
 }
 
 function toBareJid(jid) {
@@ -544,13 +641,105 @@ function wrapSocketFactory(fn) {
         }
       }
 
-      // Guard sendMessage with a generous 45s timeout for media uploads/usync and surface dispatch errors
+      // Guard sendMessage with a generous 45s timeout, startup-banner cooldown, and dispatch error reporting
+      const startupStateFile = path.join(process.cwd(), '.lyrihost_startup_state.json');
+      const startupCooldownMs = (() => {
+        const raw = Number.parseInt(process.env.LYRIHOST_STARTUP_COOLDOWN_MS || '', 10);
+        return Number.isFinite(raw) && raw >= 0 ? raw : 6 * 60 * 60 * 1000;
+      })();
+
+      let lastSocketOpenAt = 0;
+      let lastIncomingCommandAt = 0;
+      let lastSocketActivityAt = Date.now();
+
+      const readStartupState = () => {
+        try {
+          if (fs.existsSync(startupStateFile)) {
+            const parsed = JSON.parse(fs.readFileSync(startupStateFile, 'utf8'));
+            if (parsed && typeof parsed === 'object') return parsed;
+          }
+        } catch {
+          // ignore corrupted startup cache
+        }
+        return { sentAt: 0, textSample: '' };
+      };
+
+      const writeStartupState = (sentAt, textSample) => {
+        try {
+          origWriteFileSync(
+            startupStateFile,
+            JSON.stringify({ sentAt, textSample: String(textSample || '').slice(0, 120) }),
+            'utf8'
+          );
+        } catch {
+          // ignore non-writable cwd
+        }
+      };
+
+      const extractOutgoingText = (content) => {
+        if (!content || typeof content !== 'object') return '';
+        if (typeof content.text === 'string') return content.text;
+        if (typeof content.caption === 'string') return content.caption;
+        return '';
+      };
+
+      const shouldSuppressStartupGreeting = (targetJid, content, options) => {
+        if (!startupCooldownMs || typeof targetJid !== 'string') return false;
+        if (options && typeof options === 'object' && options.quoted) return false;
+        if (content && typeof content === 'object' && content.react) return false;
+
+        const ownBarePhone = sock.user && sock.user.id ? toBareJid(sock.user.id) : null;
+        const ownBareLid = sock.user && sock.user.lid ? toBareJid(sock.user.lid) : null;
+        const bareTarget = toBareJid(targetJid);
+        const isSelfChat =
+          (ownBarePhone && bareTarget === ownBarePhone) ||
+          (ownBareLid && bareTarget === ownBareLid);
+        if (!isSelfChat) return false;
+
+        const now = Date.now();
+        // Only treat as a startup greeting if emitted shortly after socket open with no recent user command
+        if (now - lastSocketOpenAt > 20000) return false;
+        if (now - lastIncomingCommandAt < 5000) return false;
+
+        const text = extractOutgoingText(content).trim();
+        const sample = text.slice(0, 120);
+        const looksLikeStartupBanner =
+          /connected|online|mode\s*[: ]|prefix|hosting\.|started|deploy|alive|keith-md|elite-pro|cypherx|toxic|sila-md|turbofex|vanguard|dave-x|ultra-guru|bwm-xmd/i.test(
+            text
+          );
+
+        const prev = readStartupState();
+        const sameBannerAsBefore = Boolean(sample && prev.textSample && prev.textSample === sample);
+        if (!looksLikeStartupBanner && !sameBannerAsBefore) return false;
+
+        if (prev.sentAt && now - Number(prev.sentAt) < startupCooldownMs) {
+          return true;
+        }
+        writeStartupState(now, sample);
+        return false;
+      };
+
       if (typeof sock.sendMessage === 'function' && !sock.sendMessage.__lyrihostGuarded) {
         const origSendMessage = sock.sendMessage.bind(sock);
         let lastSendErrLogAt = 0;
-        const guardedSendMessage = async (...mArgs) => {
+        let lastCooldownLogAt = 0;
+        const guardedSendMessage = async (jid, content, options, ...restArgs) => {
+          if (shouldSuppressStartupGreeting(jid, content, options)) {
+            const now = Date.now();
+            if (now - lastCooldownLogAt > 60000) {
+              lastCooldownLogAt = now;
+              console.log('[runtime] Startup greeting cooldown active (6h); skipped duplicate self-chat startup banner.');
+            }
+            return {
+              key: { remoteJid: jid, fromMe: true, id: `lyrihost-cooldown-${now}` },
+              status: 1,
+            };
+          }
           try {
-            const res = await withFastTimeout(origSendMessage(...mArgs), 45000);
+            const res = await withFastTimeout(
+              origSendMessage(jid, content, options, ...restArgs),
+              45000
+            );
             if (res === '__LYRIHOST_TIMEOUT__') {
               throw new Error('WhatsApp sendMessage timed out after 45s');
             }
@@ -596,6 +785,12 @@ function wrapSocketFactory(fn) {
         return ws.socket && typeof ws.socket === 'object' ? ws.socket : ws;
       };
 
+      const markSocketActive = () => {
+        lastSocketActivityAt = Date.now();
+        missedPongs = 0;
+        missedNoisePings = 0;
+      };
+
       const bindPongListener = () => {
         const ws = sock.ws;
         const rawWs = getRawWs();
@@ -604,7 +799,10 @@ function wrapSocketFactory(fn) {
             pongBoundSockets.add(candidate);
             candidate.on('pong', () => {
               hasSeenPong = true;
-              missedPongs = 0;
+              markSocketActive();
+            });
+            candidate.on('message', () => {
+              markSocketActive();
             });
           }
         }
@@ -613,7 +811,7 @@ function wrapSocketFactory(fn) {
       const recycleZombieSocket = (reason) => {
         missedPongs = 0;
         missedNoisePings = 0;
-        console.warn(`[runtime] ${reason}; recycling WhatsApp socket immediately...`);
+        console.warn(`[runtime] ${reason}; recycling WhatsApp socket cleanly...`);
         const ws = sock.ws;
         const rawWs = getRawWs();
         try {
@@ -657,20 +855,27 @@ function wrapSocketFactory(fn) {
           (rawWs && rawWs.readyState === 1) || (ws && (ws.isOpen === true || ws.readyState === 1))
         );
 
-        if (wsOpen) {
+        if (wsOpen && hasEverOpened) {
           closedSince = 0;
           bindPongListener();
 
+          // If real WhatsApp frames/messages/pongs arrived recently, socket is 100% healthy
+          const idleMs = Date.now() - lastSocketActivityAt;
+          if (idleMs < 35000) {
+            missedPongs = 0;
+            missedNoisePings = 0;
+          }
+
           if (rawWs && typeof rawWs.ping === 'function') {
-            if (hasSeenPong && missedPongs >= 3) {
+            if (hasSeenPong && missedPongs >= 4 && idleMs > 45000) {
               recycleZombieSocket('WhatsApp raw WebSocket stopped responding to RFC-6455 pings');
               return;
             }
-            missedPongs += 1;
+            if (hasSeenPong) missedPongs += 1;
             try {
               rawWs.ping();
             } catch {
-              missedPongs += 1;
+              if (hasSeenPong) missedPongs += 1;
             }
           }
 
@@ -691,24 +896,18 @@ function wrapSocketFactory(fn) {
             )
               .then((res) => {
                 if (res === '__LYRIHOST_TIMEOUT__') {
-                  missedNoisePings += 1;
-                  if (
-                    (hasNoisePingSucceeded && missedNoisePings >= 3) ||
-                    (missedPongs >= 3 && missedNoisePings >= 3)
-                  ) {
+                  if (hasNoisePingSucceeded) missedNoisePings += 1;
+                  if (hasNoisePingSucceeded && missedNoisePings >= 4 && Date.now() - lastSocketActivityAt > 45000) {
                     recycleZombieSocket('WhatsApp Noise IQ ping timed out repeatedly (silent zombie session)');
                   }
                 } else {
                   hasNoisePingSucceeded = true;
-                  missedNoisePings = 0;
+                  markSocketActive();
                 }
               })
               .catch(() => {
-                missedNoisePings += 1;
-                if (
-                  (hasNoisePingSucceeded && missedNoisePings >= 3) ||
-                  (missedPongs >= 3 && missedNoisePings >= 3)
-                ) {
+                if (hasNoisePingSucceeded) missedNoisePings += 1;
+                if (hasNoisePingSucceeded && missedNoisePings >= 4 && Date.now() - lastSocketActivityAt > 45000) {
                   recycleZombieSocket('WhatsApp Noise IQ ping failed repeatedly');
                 }
               })
@@ -716,11 +915,11 @@ function wrapSocketFactory(fn) {
                 noisePingInFlight = false;
               });
           }
-        } else if (hasEverOpened) {
+        } else if (!wsOpen && hasEverOpened) {
           if (closedSince === 0) closedSince = Date.now();
-          if (Date.now() - closedSince > 45000) {
+          if (Date.now() - closedSince > 120000) {
             closedSince = Date.now();
-            console.warn('[runtime] WhatsApp socket stalled offline for 45s; exiting for instant 1s supervisor recovery...');
+            console.warn('[runtime] WhatsApp socket stalled offline for 120s; exiting for clean supervisor recovery...');
             clearInterval(keepaliveTimer);
             process.exit(1);
           }
@@ -735,10 +934,10 @@ function wrapSocketFactory(fn) {
         const conn = update.connection;
         if (conn === 'open') {
           hasEverOpened = true;
+          lastSocketOpenAt = Date.now();
           closedSince = 0;
-          missedPongs = 0;
-          missedNoisePings = 0;
           bufferingCycles = 0;
+          markSocketActive();
           bindPongListener();
           if (lastLoggedConnState !== 'open') {
             lastLoggedConnState = 'open';
@@ -751,20 +950,28 @@ function wrapSocketFactory(fn) {
           console.log('[runtime] QR code generated — scan via WhatsApp > Linked Devices or set a valid SESSION_ID.');
         } else if (conn === 'close') {
           lastLoggedConnState = 'close';
+          const lastErr = update.lastDisconnect && update.lastDisconnect.error;
           const statusCode =
-            update.lastDisconnect &&
-            update.lastDisconnect.error &&
-            update.lastDisconnect.error.output &&
-            update.lastDisconnect.error.output.statusCode;
+            lastErr && lastErr.output && lastErr.output.statusCode;
+          const errMsg = lastErr && lastErr.message ? String(lastErr.message) : '';
           if (statusCode === 401 || statusCode === 403) {
             loggedOutPermanently = true;
             closedSince = 0;
             clearInterval(keepaliveTimer);
             console.warn(`[runtime] WhatsApp rejected session (code ${statusCode}). Regenerate SESSION_ID from the pairing site and redeploy.`);
+          } else if (statusCode === 440) {
+            if (closedSince === 0) closedSince = Date.now();
+            console.warn('[runtime] WhatsApp session conflict (code 440) — this SESSION_ID is active on another bot/session. Stop duplicate instances or generate a new SESSION_ID.');
           } else {
             if (closedSince === 0) closedSince = Date.now();
-            if (statusCode) {
-              console.warn(`[runtime] WhatsApp connection closed (code ${statusCode}); reconnecting...`);
+            if (statusCode === 405) {
+              loggedVersionUpgrade = false;
+              refreshWaVersionFromWhatsAppWeb(true);
+              console.warn('[runtime] WhatsApp rejected client version (code 405); refreshed latest WA Web revision and reconnecting...');
+            } else if (statusCode) {
+              console.warn(`[runtime] WhatsApp connection closed (code ${statusCode}${errMsg ? `: ${errMsg.slice(0, 80)}` : ''}); reconnecting...`);
+            } else if (errMsg) {
+              console.warn(`[runtime] WhatsApp connection closed (${errMsg.slice(0, 100)}); reconnecting...`);
             }
           }
         }
@@ -800,8 +1007,12 @@ function wrapSocketFactory(fn) {
             }
             if (event === 'messages.upsert' && typeof listener === 'function') {
               return origEvOn(event, async (chatUpdate) => {
+                markSocketActive();
                 syncSocketUserJid(sock);
                 const singleUpdates = normalizeIncomingChatUpdate(sock, chatUpdate);
+                if (singleUpdates.length > 0 && (!chatUpdate || chatUpdate.type === 'notify')) {
+                  lastIncomingCommandAt = Date.now();
+                }
                 for (const singleUpdate of singleUpdates) {
                   try {
                     const res = await withFastTimeout(listener(singleUpdate), 60000);
@@ -825,6 +1036,7 @@ function wrapSocketFactory(fn) {
               return origEvProcess(handler);
             }
             return origEvProcess(async (events) => {
+              markSocketActive();
               syncSocketUserJid(sock);
               if (events) {
                 if (events['groups.update']) invalidateFromGroupEvents('groups.update', events['groups.update']);
@@ -833,6 +1045,9 @@ function wrapSocketFactory(fn) {
               }
               if (events && events['messages.upsert']) {
                 const singleUpdates = normalizeIncomingChatUpdate(sock, events['messages.upsert']);
+                if (singleUpdates.length > 0 && events['messages.upsert'].type === 'notify') {
+                  lastIncomingCommandAt = Date.now();
+                }
                 if (singleUpdates.length === 0) {
                   const rest = { ...events };
                   delete rest['messages.upsert'];
@@ -870,6 +1085,9 @@ function wrapSocketFactory(fn) {
 }
 
 globalThis.__lyrihostWrapSocket = wrapSocketFactory;
+globalThis.__lyrihostWrapVersionFetcher = wrapVersionFetcher;
+
+const BAILEYS_PKG_RE = /baileys|whiskeysockets|adiwajshing/i;
 
 if (typeof Module.registerHooks === 'function') {
   try {
@@ -880,20 +1098,41 @@ if (typeof Module.registerHooks === 'function') {
           res &&
           res.format === 'module' &&
           typeof url === 'string' &&
-          /baileys/i.test(url) &&
-          /\/lib\/Socket\/index\.m?js$/i.test(url) &&
+          BAILEYS_PKG_RE.test(url) &&
           res.source
         ) {
           let code =
             typeof res.source === 'string'
               ? res.source
               : Buffer.from(res.source).toString('utf8');
-          if (!code.includes('__lyrihostWrapSocket')) {
+
+          if (/\/(?:lib|dist|src)\/Socket\/index\.m?js$/i.test(url) && !code.includes('__lyrihostWrapSocket')) {
             const patched = code.replace(
               /export\s+default\s+([A-Za-z0-9_$]+)\s*;?/m,
               'const __lyrihostOrigSock = $1;\nexport default (globalThis.__lyrihostWrapSocket ? globalThis.__lyrihostWrapSocket(__lyrihostOrigSock) : __lyrihostOrigSock);'
             );
             if (patched !== code) {
+              return { ...res, source: patched };
+            }
+          }
+
+          if (/\/(?:lib|dist|src)\/Utils\/generics\.m?js$/i.test(url) && !code.includes('__lyrihostWrapVersionFetcher')) {
+            let patched = code;
+            patched = patched.replace(
+              /export\s+(?:async\s+)?function\s+fetchLatestBaileysVersion\b/,
+              'async function __lyrihostOrigFetchLatestBaileysVersion'
+            );
+            patched = patched.replace(
+              /export\s+(?:async\s+)?function\s+fetchLatestWaWebVersion\b/,
+              'async function __lyrihostOrigFetchLatestWaWebVersion'
+            );
+            if (patched !== code) {
+              if (patched.includes('__lyrihostOrigFetchLatestBaileysVersion')) {
+                patched += '\nexport const fetchLatestBaileysVersion = globalThis.__lyrihostWrapVersionFetcher ? globalThis.__lyrihostWrapVersionFetcher(__lyrihostOrigFetchLatestBaileysVersion) : __lyrihostOrigFetchLatestBaileysVersion;';
+              }
+              if (patched.includes('__lyrihostOrigFetchLatestWaWebVersion')) {
+                patched += '\nexport const fetchLatestWaWebVersion = globalThis.__lyrihostWrapVersionFetcher ? globalThis.__lyrihostWrapVersionFetcher(__lyrihostOrigFetchLatestWaWebVersion) : __lyrihostOrigFetchLatestWaWebVersion;';
+              }
               return { ...res, source: patched };
             }
           }
@@ -911,11 +1150,17 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
   const loaded = origModuleLoad.apply(this, arguments);
   if (
     typeof request === 'string' &&
-    /baileys/i.test(request) &&
+    BAILEYS_PKG_RE.test(request) &&
     loaded &&
     typeof loaded === 'object'
   ) {
     refreshWaVersionFromModule(loaded);
+    if (typeof loaded.fetchLatestWaWebVersion === 'function') {
+      loaded.fetchLatestWaWebVersion = wrapVersionFetcher(loaded.fetchLatestWaWebVersion);
+    }
+    if (typeof loaded.fetchLatestBaileysVersion === 'function') {
+      loaded.fetchLatestBaileysVersion = wrapVersionFetcher(loaded.fetchLatestBaileysVersion);
+    }
     if (typeof loaded.default === 'function') {
       loaded.default = wrapSocketFactory(loaded.default);
     }

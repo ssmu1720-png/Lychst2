@@ -12,6 +12,7 @@ import {
   sendInput,
   startProcess,
   stopProcess,
+  stopProcessAndWait,
   waitForProcessStability,
 } from './processManager.ts';
 import {
@@ -428,8 +429,7 @@ export function createBotsRouter(
       res.status(404).json({ error: 'Bot not found' });
       return;
     }
-    stopProcess(dep.id);
-    await new Promise((r) => setTimeout(r, 500));
+    await stopProcessAndWait(dep.id, dep.id, 1500);
 
     const botDir = getBotDir(dep.id);
     if (!fs.existsSync(botDir)) {
