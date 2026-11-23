@@ -213,7 +213,9 @@ async function recoverBotProcess(dep: BotDeployment): Promise<void> {
   }
 
   try {
-    writeDotEnvFile(botDir, dep.settings.envVars);
+    writeDotEnvFile(botDir, dep.settings.envVars, {
+      assignedPort: getAssignedBotPort(dep.numericId),
+    });
     const resolved = resolveDeploymentCommands(botDir, dep.settings);
     dep.settings.startCommand = resolved.startCommand;
     const bp = startProcess(dep.id, resolved.startCommand, {
@@ -510,12 +512,15 @@ function isLikelySecretKey(key: string): boolean {
   return /(TOKEN|SECRET|KEY|PASSWORD|PASS|AUTH|CREDENTIAL|URI|DSN)/i.test(key);
 }
 
+const SCAN_COLLIDING_PORTS = new Set(['', '3000', '5000', '8000', '8080']);
+const SCAN_PLACEHOLDER_RE = /^(?:YOUR_SESSION_ID_HERE|254XXXXXXXXX|62xxxx|your[_-].*)$/i;
+
 function parseEnvFileKeys(content: string, sourceFile: string): EnvVarEntry[] {
   const entries: EnvVarEntry[] = [];
   const seen = new Set<string>();
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!line || line.startsWith('#') || line.startsWith('//')) continue;
     const eqIndex = line.indexOf('=');
     if (eqIndex <= 0) continue;
     const key = line.slice(0, eqIndex).trim().replace(/^export\s+/, '');
@@ -524,6 +529,12 @@ function parseEnvFileKeys(content: string, sourceFile: string): EnvVarEntry[] {
     let val = line.slice(eqIndex + 1).trim();
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
+    }
+    if ((key === 'PORT' || key === 'SERVER_PORT') && SCAN_COLLIDING_PORTS.has(val.trim())) {
+      continue;
+    }
+    if (SCAN_PLACEHOLDER_RE.test(val.trim())) {
+      val = '';
     }
     const secret = isLikelySecretKey(key);
     entries.push({
@@ -666,17 +677,28 @@ async function performGitHubScan(
   const hasGitignore = pathSet.has('.gitignore');
   const committedEnvFiles = filePaths.filter((p) => /(^|\/)\.env(\.local|\.prod|\.production)?$/i.test(p));
 
-  const envTemplatePath = ['.env.example', '.env.sample', 'set.env', 'config.env'].find((f) => pathSet.has(f));
-  const [pkgRaw, reqRaw, pyprojRaw, dockerRaw, envExampleRaw, gitignoreRaw] = await Promise.all([
-    hasPackageJson ? fetchRepoFileContent(owner, repo, 'package.json', targetBranch, effectiveToken) : Promise.resolve(null),
-    hasRequirementsTxt ? fetchRepoFileContent(owner, repo, 'requirements.txt', targetBranch, effectiveToken) : Promise.resolve(null),
-    hasPyproject ? fetchRepoFileContent(owner, repo, 'pyproject.toml', targetBranch, effectiveToken) : Promise.resolve(null),
-    pathSet.has('Dockerfile') ? fetchRepoFileContent(owner, repo, 'Dockerfile', targetBranch, effectiveToken) : Promise.resolve(null),
-    envTemplatePath
-      ? fetchRepoFileContent(owner, repo, envTemplatePath, targetBranch, effectiveToken)
-      : Promise.resolve(null),
-    hasGitignore ? fetchRepoFileContent(owner, repo, '.gitignore', targetBranch, effectiveToken) : Promise.resolve(null),
-  ]);
+  const envTemplatePath = [
+    '.env.example',
+    '.env.sample',
+    '.env-sample',
+    'set.env',
+    'config.env',
+    '.env',
+    'session_id.txt',
+  ].find((f) => pathSet.has(f));
+  const [pkgRaw, reqRaw, pyprojRaw, dockerRaw, envExampleRaw, appJsonRaw, procfileRaw, gitignoreRaw] =
+    await Promise.all([
+      hasPackageJson ? fetchRepoFileContent(owner, repo, 'package.json', targetBranch, effectiveToken) : Promise.resolve(null),
+      hasRequirementsTxt ? fetchRepoFileContent(owner, repo, 'requirements.txt', targetBranch, effectiveToken) : Promise.resolve(null),
+      hasPyproject ? fetchRepoFileContent(owner, repo, 'pyproject.toml', targetBranch, effectiveToken) : Promise.resolve(null),
+      pathSet.has('Dockerfile') ? fetchRepoFileContent(owner, repo, 'Dockerfile', targetBranch, effectiveToken) : Promise.resolve(null),
+      envTemplatePath
+        ? fetchRepoFileContent(owner, repo, envTemplatePath, targetBranch, effectiveToken)
+        : Promise.resolve(null),
+      pathSet.has('app.json') ? fetchRepoFileContent(owner, repo, 'app.json', targetBranch, effectiveToken) : Promise.resolve(null),
+      pathSet.has('Procfile') ? fetchRepoFileContent(owner, repo, 'Procfile', targetBranch, effectiveToken) : Promise.resolve(null),
+      hasGitignore ? fetchRepoFileContent(owner, repo, '.gitignore', targetBranch, effectiveToken) : Promise.resolve(null),
+    ]);
 
   let dependencies: string[] = [];
   let detectedRuntime: RuntimeEnvironment = 'node-20';
@@ -693,6 +715,32 @@ async function performGitHubScan(
   if (envExampleRaw && envTemplatePath) {
     for (const item of parseEnvFileKeys(envExampleRaw, envTemplatePath)) {
       envMap.set(item.key, item);
+    }
+  }
+
+  if (appJsonRaw) {
+    try {
+      const appJson = JSON.parse(appJsonRaw) as {
+        env?: Record<string, { value?: string; description?: string; required?: boolean }>;
+      };
+      if (appJson.env && typeof appJson.env === 'object') {
+        for (const [k, meta] of Object.entries(appJson.env)) {
+          const cleanKey = k.trim();
+          if (!/^[A-Z0-9_]+$/i.test(cleanKey) || envMap.has(cleanKey)) continue;
+          if (cleanKey === 'PORT' || cleanKey === 'SERVER_PORT') continue;
+          const rawVal = typeof meta?.value === 'string' ? meta.value.trim() : '';
+          const val = SCAN_PLACEHOLDER_RE.test(rawVal) ? '' : rawVal;
+          const secret = isLikelySecretKey(cleanKey);
+          envMap.set(cleanKey, {
+            key: cleanKey,
+            value: secret ? '' : val,
+            isSecret: secret,
+            detectedFrom: 'app.json',
+          });
+        }
+      }
+    } catch {
+      // ignore invalid app.json
     }
   }
 
@@ -713,7 +761,10 @@ async function performGitHubScan(
       dependencies = Object.keys(pkg.dependencies || {});
       const depKeysLower = Object.keys(allDeps).map((d) => d.toLowerCase());
 
-      if (pkg.engines?.node && pkg.engines.node.includes('22')) {
+      if (
+        (pkg.engines?.node && /(?:>=?\s*22|\b22\b)/i.test(pkg.engines.node)) ||
+        /--experimental-sqlite/i.test(pkg.scripts?.start || '')
+      ) {
         detectedRuntime = 'node-22';
       } else if (pathSet.has('bun.lockb') || pathSet.has('bun.lock')) {
         detectedRuntime = 'bun-1';
@@ -749,12 +800,26 @@ async function performGitHubScan(
       }
       if (pkg.scripts?.start) {
         suggestedStartCmd = detectedRuntime === 'bun-1' ? 'bun run start' : 'npm start';
+        if (pkg.main) {
+          detectedEntryPoint = pkg.main;
+        }
+      } else if (procfileRaw) {
+        const procLine = procfileRaw
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => /^(?:web|worker)\s*:/i.test(l));
+        if (procLine) {
+          suggestedStartCmd = procLine.replace(/^(?:web|worker)\s*:\s*/i, '').trim() || 'npm start';
+        }
+        if (pkg.main) {
+          detectedEntryPoint = pkg.main;
+        }
       } else if (pkg.main) {
         suggestedStartCmd = `node ${pkg.main}`;
         detectedEntryPoint = pkg.main;
       }
 
-      if (!pkg.scripts?.start && !pkg.main) {
+      if (!pkg.scripts?.start && !pkg.main && !procfileRaw) {
         securityFindings.push({
           id: makeId('sec'),
           severity: 'warning',
@@ -829,7 +894,13 @@ async function performGitHubScan(
   const candidateFiles = [
     detectedEntryPoint,
     'settings.js',
+    'set.js',
     'config.js',
+    'config/settings.js',
+    'core/setup.js',
+    'system/config.js',
+    'Guru Tech/index.js',
+    'black/index.js',
     'index.js',
     'index.ts',
     'src/index.ts',
@@ -842,7 +913,7 @@ async function performGitHubScan(
   ]
     .filter((p): p is string => Boolean(p) && pathSet.has(p))
     .filter((v, i, arr) => arr.indexOf(v) === i)
-    .slice(0, 5);
+    .slice(0, 6);
 
   const codeContents = await Promise.all(
     candidateFiles.map(async (filePath) => ({
@@ -1436,7 +1507,9 @@ async function startServer() {
 
     const botDir = getBotDir(dep.id);
     if (fs.existsSync(botDir)) {
-      writeDotEnvFile(botDir, dep.settings.envVars);
+      writeDotEnvFile(botDir, dep.settings.envVars, {
+        assignedPort: getAssignedBotPort(dep.numericId),
+      });
     }
 
     appendLog(dep, 'info', 'config', 'Updated deployment configuration and environment variables.');
@@ -1602,7 +1675,9 @@ async function startServer() {
       } else if (!isRunning(dep.id, dep.pid)) {
         try {
           await stopProcessAndWait(dep.id, dep.id, 1000);
-          writeDotEnvFile(botDir, dep.settings.envVars);
+          writeDotEnvFile(botDir, dep.settings.envVars, {
+            assignedPort: getAssignedBotPort(dep.numericId),
+          });
           const resolved = resolveDeploymentCommands(botDir, dep.settings);
           dep.settings.startCommand = resolved.startCommand;
           const bp = startProcess(dep.id, resolved.startCommand, {
@@ -1675,7 +1750,9 @@ async function startServer() {
           void deployEngine.deploy(dep);
         } else {
           try {
-            writeDotEnvFile(botDir, dep.settings.envVars);
+            writeDotEnvFile(botDir, dep.settings.envVars, {
+              assignedPort: getAssignedBotPort(dep.numericId),
+            });
             const resolved = resolveDeploymentCommands(botDir, dep.settings);
             dep.settings.startCommand = resolved.startCommand;
             const bp = startProcess(dep.id, resolved.startCommand, {

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { z } from 'zod';
 import {
   ensureBotsDir,
+  getAssignedBotPort,
   getBotDir,
   getLogs,
   isAutoRestarting,
@@ -359,7 +360,9 @@ export function createBotsRouter(
     }
 
     try {
-      writeDotEnvFile(botDir, dep.settings.envVars);
+      writeDotEnvFile(botDir, dep.settings.envVars, {
+        assignedPort: getAssignedBotPort(dep.numericId),
+      });
       const resolved = resolveDeploymentCommands(botDir, dep.settings);
       dep.settings.startCommand = resolved.startCommand;
       const bp = startProcess(dep.id, resolved.startCommand, {
@@ -438,7 +441,9 @@ export function createBotsRouter(
     }
 
     try {
-      writeDotEnvFile(botDir, dep.settings.envVars);
+      writeDotEnvFile(botDir, dep.settings.envVars, {
+        assignedPort: getAssignedBotPort(dep.numericId),
+      });
       const resolved = resolveDeploymentCommands(botDir, dep.settings);
       dep.settings.startCommand = resolved.startCommand;
       const bp = startProcess(dep.id, resolved.startCommand, {

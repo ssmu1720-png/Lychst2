@@ -328,13 +328,32 @@ export function startProcess(
   delete parentEnv.npm_config_production;
   delete parentEnv.NPM_CONFIG_PRODUCTION;
 
+  const hostPortStr = String(process.env.PORT || '3000');
   const assignedPort = String(getAssignedBotPort(options.numericId));
+  const sanitizedBotEnv: Record<string, string> = { ...(options.env || {}) };
+  const rawBotPort = (sanitizedBotEnv.PORT || '').trim();
+  const isCollidingPort =
+    !rawBotPort ||
+    rawBotPort === hostPortStr ||
+    rawBotPort === '3000' ||
+    rawBotPort === '5000' ||
+    rawBotPort === '8000' ||
+    rawBotPort === '8080';
+  const effectivePort = isCollidingPort ? assignedPort : rawBotPort;
+  sanitizedBotEnv.PORT = effectivePort;
+  if (sanitizedBotEnv.SERVER_PORT !== undefined) {
+    const rawSrvPort = sanitizedBotEnv.SERVER_PORT.trim();
+    if (!rawSrvPort || rawSrvPort === hostPortStr || rawSrvPort === '3000' || rawSrvPort === '5000' || rawSrvPort === '8000' || rawSrvPort === '8080') {
+      sanitizedBotEnv.SERVER_PORT = effectivePort;
+    }
+  }
+
   const child = spawn(trimmedCmd, {
     cwd: botDir,
     env: {
       ...parentEnv,
-      PORT: assignedPort,
-      ...(options.env || {}),
+      ...sanitizedBotEnv,
+      PORT: effectivePort,
       NODE_ENV: 'production',
       TERM: 'xterm-256color',
       FORCE_COLOR: '1',

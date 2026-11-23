@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -276,6 +277,47 @@ export interface ResolvedBotCommands {
   notes: string[];
 }
 
+function parseProcfileStartCommand(botDir: string): string | null {
+  const procfilePath = path.join(botDir, 'Procfile');
+  if (!fs.existsSync(procfilePath)) return null;
+  try {
+    const lines = fs.readFileSync(procfilePath, 'utf-8').split(/\r?\n/);
+    let workerCmd: string | null = null;
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const webMatch = line.match(/^web\s*:\s*(.+)$/i);
+      if (webMatch && webMatch[1].trim()) {
+        return webMatch[1].trim();
+      }
+      const workMatch = line.match(/^worker\s*:\s*(.+)$/i);
+      if (workMatch && workMatch[1].trim() && !workerCmd) {
+        workerCmd = workMatch[1].trim();
+      }
+    }
+    return workerCmd;
+  } catch {
+    return null;
+  }
+}
+
+function parseEcosystemTarget(botDir: string, fileName: string): { script: string; nodeArgs?: string } | null {
+  const ecoPath = path.join(botDir, fileName);
+  if (!fs.existsSync(ecoPath)) return null;
+  try {
+    const raw = fs.readFileSync(ecoPath, 'utf-8');
+    const scriptMatch = raw.match(/script\s*:\s*['"`]([^'"`]+)['"`]/);
+    if (!scriptMatch || !scriptMatch[1]) return null;
+    const argsMatch = raw.match(/node_args\s*:\s*['"`]([^'"`]+)['"`]/);
+    return {
+      script: scriptMatch[1].trim(),
+      nodeArgs: argsMatch?.[1]?.trim() || undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function resolveDeploymentCommands(
   botDir: string,
   settings: Pick<BotSettings, 'installCommand' | 'buildCommand' | 'startCommand' | 'runtime'>
@@ -289,6 +331,7 @@ export function resolveDeploymentCommands(
   const pkgPath = path.join(botDir, 'package.json');
   const reqPath = path.join(botDir, 'requirements.txt');
   const pyprojPath = path.join(botDir, 'pyproject.toml');
+  const procfileCmd = parseProcfileStartCommand(botDir);
 
   const hasPkg = fs.existsSync(pkgPath);
   const hasReq = fs.existsSync(reqPath);
@@ -312,12 +355,20 @@ export function resolveDeploymentCommands(
   if (hasPkg) {
     let pkg: {
       main?: string;
+      engines?: { node?: string };
       scripts?: Record<string, string>;
     } = {};
     try {
       pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as typeof pkg;
     } catch {
       pkg = {};
+    }
+
+    if (
+      (pkg.engines?.node && /(?:>=?\s*22|\b22\b)/i.test(pkg.engines.node)) ||
+      /--experimental-sqlite/i.test(pkg.scripts?.start || '')
+    ) {
+      runtime = 'node-22';
     }
 
     // Adapt package managers not installed in runtime or brittle frozen/ci commands
@@ -354,28 +405,39 @@ export function resolveDeploymentCommands(
     }
 
     // Unwrap PM2 / Nodemon / Forever process-manager wrappers so bots run directly under Lyrihost's 24/7 supervisor
-    const extractDirectScriptTarget = (cmdText: string): string | null => {
+    const unwrapStartTarget = (cmdText: string): string | null => {
       const pm2Match = cmdText.match(/\b(?:pm2|pm2-runtime|forever)\s+(?:start\s+)?([^\s;&|]+)/i);
       if (pm2Match && pm2Match[1] && !pm2Match[1].startsWith('-')) {
-        if (/ecosystem\.config\.(?:c?js|json)$/i.test(pm2Match[1])) {
-          return ['index.js', 'bot.js', 'main.js', 'server.js'].find((f) => fs.existsSync(path.join(botDir, f))) || null;
+        const target = pm2Match[1];
+        if (/ecosystem\.config\.(?:c?js|mjs|json)$/i.test(target)) {
+          const eco = parseEcosystemTarget(botDir, target);
+          if (eco) {
+            if (/\.(?:ts|tsx|mts|cts)$/i.test(eco.script)) {
+              return `npx --yes tsx ${JSON.stringify(eco.script)}`;
+            }
+            return eco.nodeArgs
+              ? `node ${eco.nodeArgs} ${JSON.stringify(eco.script)}`
+              : `node ${JSON.stringify(eco.script)}`;
+          }
+          const fallbackEntry = ['index.js', 'bot.js', 'main.js', 'server.js'].find((f) =>
+            fs.existsSync(path.join(botDir, f))
+          );
+          return fallbackEntry ? `node ${JSON.stringify(fallbackEntry)}` : null;
         }
-        return pm2Match[1];
+        if (/\.(?:ts|tsx|mts|cts)$/i.test(target)) {
+          return `npx --yes tsx ${JSON.stringify(target)}`;
+        }
+        return `node ${JSON.stringify(target)}`;
       }
       const nodemonMatch = cmdText.match(/\bnodemon\s+([^\s;&|]+)/i);
       if (nodemonMatch && nodemonMatch[1] && !nodemonMatch[1].startsWith('-')) {
-        return nodemonMatch[1];
+        const target = nodemonMatch[1];
+        if (/\.(?:ts|tsx|mts|cts)$/i.test(target)) {
+          return `npx --yes tsx ${JSON.stringify(target)}`;
+        }
+        return `node ${JSON.stringify(target)}`;
       }
       return null;
-    };
-
-    const unwrapStartTarget = (cmdText: string): string | null => {
-      const directTarget = extractDirectScriptTarget(cmdText);
-      if (!directTarget) return null;
-      if (/\.(?:ts|tsx|mts|cts)$/i.test(directTarget)) {
-        return `npx --yes tsx ${JSON.stringify(directTarget)}`;
-      }
-      return `node ${JSON.stringify(directTarget)}`;
     };
 
     const isDefaultStart =
@@ -407,39 +469,45 @@ export function resolveDeploymentCommands(
         }
       }
     } else if (isDefaultStart && (!pkg.scripts || !pkg.scripts.start)) {
-      const nodeCandidates = [
-        pkg.main,
-        'dist/index.js',
-        'build/index.js',
-        'index.js',
-        'bot.js',
-        'main.js',
-        'app.js',
-        'server.js',
-        'index.mjs',
-        'index.cjs',
-        'src/index.js',
-        'src/bot.js',
-        'src/main.js',
-        'index.ts',
-        'bot.ts',
-        'main.ts',
-        'src/index.ts',
-        'src/bot.ts',
-        'src/main.ts',
-      ].filter((c): c is string => Boolean(c));
+      const procUnwrapped = procfileCmd ? unwrapStartTarget(procfileCmd) || procfileCmd : null;
+      if (procUnwrapped && !/\b(npm|yarn|pnpm|bun)\s+(run\s+)?start\b/i.test(procUnwrapped)) {
+        startCommand = procUnwrapped;
+        notes.push(`package.json has no "start" script; using Procfile command (${startCommand}).`);
+      } else {
+        const nodeCandidates = [
+          pkg.main,
+          'dist/index.js',
+          'build/index.js',
+          'index.js',
+          'bot.js',
+          'main.js',
+          'app.js',
+          'server.js',
+          'index.mjs',
+          'index.cjs',
+          'src/index.js',
+          'src/bot.js',
+          'src/main.js',
+          'index.ts',
+          'bot.ts',
+          'main.ts',
+          'src/index.ts',
+          'src/bot.ts',
+          'src/main.ts',
+        ].filter((c): c is string => Boolean(c));
 
-      const matchedEntry = nodeCandidates.find((rel) => fs.existsSync(path.join(botDir, rel)));
-      if (matchedEntry) {
-        if (/\.(?:ts|tsx|mts|cts)$/i.test(matchedEntry)) {
-          if (pkg.scripts?.build && !buildCommand) {
-            buildCommand = 'npm run build';
+        const matchedEntry = nodeCandidates.find((rel) => fs.existsSync(path.join(botDir, rel)));
+        if (matchedEntry) {
+          if (/\.(?:ts|tsx|mts|cts)$/i.test(matchedEntry)) {
+            if (pkg.scripts?.build && !buildCommand) {
+              buildCommand = 'npm run build';
+            }
+            startCommand = `npx --yes tsx ${JSON.stringify(matchedEntry)}`;
+            notes.push(`package.json has no "start" script; auto-selected TypeScript entrypoint ${matchedEntry}.`);
+          } else {
+            startCommand = `node ${JSON.stringify(matchedEntry)}`;
+            notes.push(`package.json has no "start" script; auto-selected entrypoint ${matchedEntry}.`);
           }
-          startCommand = `npx --yes tsx ${JSON.stringify(matchedEntry)}`;
-          notes.push(`package.json has no "start" script; auto-selected TypeScript entrypoint ${matchedEntry}.`);
-        } else {
-          startCommand = `node ${JSON.stringify(matchedEntry)}`;
-          notes.push(`package.json has no "start" script; auto-selected entrypoint ${matchedEntry}.`);
         }
       }
     } else if (/^\s*bun\s+(run\s+)?start\b/i.test(startCommand) && !commandExists('bun')) {
@@ -470,9 +538,14 @@ export function resolveDeploymentCommands(
       buildCommand = '';
     }
 
-    if (/^\s*(npm|yarn|pnpm|bun|docker)\b/i.test(startCommand) && foundPyEntry) {
-      startCommand = `${pyBin} ${JSON.stringify(foundPyEntry)}`;
-      notes.push(`Detected Python entrypoint (${foundPyEntry}); adapted start command.`);
+    if (/^\s*(npm|yarn|pnpm|bun|docker)\b/i.test(startCommand)) {
+      if (procfileCmd && /\bpython/i.test(procfileCmd)) {
+        startCommand = procfileCmd;
+        notes.push(`Detected Python Procfile command (${startCommand}).`);
+      } else if (foundPyEntry) {
+        startCommand = `${pyBin} ${JSON.stringify(foundPyEntry)}`;
+        notes.push(`Detected Python entrypoint (${foundPyEntry}); adapted start command.`);
+      }
     }
   }
 
@@ -509,6 +582,7 @@ export function runShellStep(
       npm_config_yes: 'true',
       npm_config_audit: 'false',
       npm_config_fund: 'false',
+      npm_config_optional: 'true',
       npm_config_prefer_offline: 'false',
       PUPPETEER_SKIP_DOWNLOAD: 'true',
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
@@ -619,11 +693,21 @@ export function buildEnvMap(envVars: EnvVarEntry[]): Record<string, string> {
     if (!map.PREFIXES) map.PREFIXES = effectivePrefix;
   }
 
-  // Sync Owner aliases across templates (OWNER_NUMBER <-> DEV)
-  if (map.OWNER_NUMBER && !map.DEV) {
-    map.DEV = map.OWNER_NUMBER;
-  } else if (map.DEV && !map.OWNER_NUMBER) {
-    map.OWNER_NUMBER = map.DEV;
+  // Sync Owner aliases across templates (OWNER_NUMBER <-> DEV <-> NUMBER)
+  const effectiveOwner = map.OWNER_NUMBER || map.DEV || map.NUMBER || map.PAIRING_NUMBER || '';
+  if (effectiveOwner) {
+    if (!map.OWNER_NUMBER) map.OWNER_NUMBER = effectiveOwner;
+    if (!map.DEV) map.DEV = effectiveOwner;
+    if (!map.NUMBER) map.NUMBER = effectiveOwner;
+  } else if (map.PHONE_NUMBER) {
+    map.OWNER_NUMBER = map.PHONE_NUMBER;
+  }
+
+  // Sync Bot Name aliases across templates (BOT_NAME <-> BOTNAME)
+  if (map.BOT_NAME && !map.BOTNAME) {
+    map.BOTNAME = map.BOT_NAME;
+  } else if (map.BOTNAME && !map.BOT_NAME) {
+    map.BOT_NAME = map.BOTNAME;
   }
 
   // Sync Bot Mode aliases across templates (MODE <-> BOT_MODE <-> WORK_TYPE <-> WORKTYPE)
@@ -635,6 +719,15 @@ export function buildEnvMap(envVars: EnvVarEntry[]): Record<string, string> {
     if (!map.WORKTYPE) map.WORKTYPE = effectiveMode;
   }
 
+  // Sync Timezone aliases across templates (TZ <-> TIME_ZONE <-> TIMEZONE <-> BOT_TIMEZONE)
+  const effectiveTz = map.TZ || map.TIME_ZONE || map.TIMEZONE || map.BOT_TIMEZONE || '';
+  if (effectiveTz) {
+    if (!map.TZ) map.TZ = effectiveTz;
+    if (!map.TIME_ZONE) map.TIME_ZONE = effectiveTz;
+    if (!map.TIMEZONE) map.TIMEZONE = effectiveTz;
+    if (!map.BOT_TIMEZONE) map.BOT_TIMEZONE = effectiveTz;
+  }
+
   return map;
 }
 
@@ -644,20 +737,57 @@ function formatEnvValue(val: string): string {
   return JSON.stringify(val);
 }
 
-function mergeEnvFile(filePath: string, map: Record<string, string>): void {
+const COLLIDING_DEFAULT_PORTS = new Set(['', '3000', '5000', '8000', '8080']);
+const PLACEHOLDER_VALUE_RE = /^(?:"?YOUR_SESSION_ID_HERE"?|"?254XXXXXXXXX"?|"?62xxxx"?)$/i;
+
+function sanitizePortInEnvMap(map: Record<string, string>, assignedPort?: number): Record<string, string> {
+  if (!assignedPort || assignedPort <= 0) return map;
+  const hostPort = String(process.env.PORT || '3000');
+  const next = { ...map };
+  const portStr = String(assignedPort);
+
+  if (next.PORT !== undefined) {
+    const clean = next.PORT.trim();
+    if (COLLIDING_DEFAULT_PORTS.has(clean) || clean === hostPort) {
+      next.PORT = portStr;
+    }
+  }
+  if (next.SERVER_PORT !== undefined) {
+    const cleanSrv = next.SERVER_PORT.trim();
+    if (COLLIDING_DEFAULT_PORTS.has(cleanSrv) || cleanSrv === hostPort) {
+      next.SERVER_PORT = portStr;
+    }
+  }
+  return next;
+}
+
+function mergeEnvFile(filePath: string, map: Record<string, string>, assignedPort?: number): void {
   const merged: Record<string, string> = {};
+  const hostPort = String(process.env.PORT || '3000');
+
   if (fs.existsSync(filePath)) {
     const existing = fs.readFileSync(filePath, 'utf-8');
     for (const rawLine of existing.split(/\r?\n/)) {
       const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
+      if (!line || line.startsWith('#') || line.startsWith('//')) continue;
       const eq = line.indexOf('=');
       if (eq === -1) continue;
-      const k = line.slice(0, eq).trim();
+      const k = line.slice(0, eq).trim().replace(/^export\s+/, '');
       const v = line.slice(eq + 1).trim();
-      if (k) merged[k] = v;
+      if (!k) continue;
+      if (PLACEHOLDER_VALUE_RE.test(v)) continue;
+      if (
+        (k === 'PORT' || k === 'SERVER_PORT') &&
+        assignedPort &&
+        (COLLIDING_DEFAULT_PORTS.has(v.replace(/^["']|["']$/g, '')) || v.replace(/^["']|["']$/g, '') === hostPort)
+      ) {
+        merged[k] = String(assignedPort);
+      } else {
+        merged[k] = v;
+      }
     }
   }
+
   for (const [k, v] of Object.entries(map)) {
     if (v !== '') {
       merged[k] = formatEnvValue(v);
@@ -671,22 +801,98 @@ function mergeEnvFile(filePath: string, map: Record<string, string>): void {
   }
 }
 
-export function writeDotEnvFile(botDir: string, envVars: EnvVarEntry[]): void {
-  const map = buildEnvMap(envVars);
-  const lines = Object.entries(map).map(([k, v]) => `${k}=${formatEnvValue(v)}`);
-  if (lines.length > 0) {
-    fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n', 'utf-8');
+function tryDecodeBaileysCreds(rawSession: string): Record<string, unknown> | null {
+  const trimmed = rawSession.trim();
+  if (!trimmed) return null;
+  const cleaned = trimmed
+    .replace(/^data:application\/json;base64,/i, '')
+    .replace(/^base64:/i, '');
+  const strippedPrefix = cleaned.includes('~')
+    ? cleaned.slice(cleaned.indexOf('~') + 1)
+    : cleaned.includes(';;;')
+      ? cleaned.slice(cleaned.indexOf(';;;') + 3)
+      : cleaned;
+
+  const candidates = [cleaned, strippedPrefix];
+  for (const c of candidates) {
+    try {
+      const obj = JSON.parse(c) as Record<string, unknown>;
+      if (obj && typeof obj === 'object' && ('noiseKey' in obj || 'signedIdentityKey' in obj)) {
+        return obj;
+      }
+    } catch {
+      // ignore non-JSON
+    }
+    try {
+      const decoded = Buffer.from(c, 'base64').toString('utf-8');
+      const obj = JSON.parse(decoded) as Record<string, unknown>;
+      if (obj && typeof obj === 'object' && ('noiseKey' in obj || 'signedIdentityKey' in obj)) {
+        return obj;
+      }
+    } catch {
+      // ignore non-base64 JSON
+    }
+  }
+  return null;
+}
+
+function resetStaleSessionIfChanged(botDir: string, sessionVal: string): void {
+  const cleanSession = sessionVal.trim();
+  if (!cleanSession) return;
+  const sigFile = path.join(botDir, '.lyrihost_session_sig');
+  const nextSig = crypto.createHash('sha256').update(cleanSession).digest('hex').slice(0, 24);
+  try {
+    const prevSig = fs.existsSync(sigFile) ? fs.readFileSync(sigFile, 'utf-8').trim() : '';
+    if (prevSig && prevSig !== nextSig) {
+      for (const dir of ['session', 'auth_info_baileys', path.join('database', 'auth')]) {
+        const target = path.join(botDir, dir);
+        if (fs.existsSync(target)) {
+          fs.rmSync(target, { recursive: true, force: true });
+        }
+      }
+    }
+    fs.writeFileSync(sigFile, nextSig + '\n', 'utf-8');
+  } catch {
+    // non-fatal signature sync error
+  }
+}
+
+export function writeDotEnvFile(
+  botDir: string,
+  envVars: EnvVarEntry[],
+  options: { assignedPort?: number } = {}
+): void {
+  const rawMap = buildEnvMap(envVars);
+  const map = sanitizePortInEnvMap(rawMap, options.assignedPort);
+
+  resetStaleSessionIfChanged(botDir, map.SESSION_ID || map.SESSION || '');
+
+  // Merge .env instead of wiping repository defaults (ELITE-PRO-V1, KING-MD, vanguardmd)
+  const dotEnvPath = path.join(botDir, '.env');
+  if (Object.keys(map).length > 0 || fs.existsSync(dotEnvPath)) {
+    mergeEnvFile(dotEnvPath, map, options.assignedPort);
   }
 
-  // Sync repos that load set.env (e.g. Keith) or config.env explicitly
+  // Sync repos that load set.env (Keith) or config.env (BWM-XMD-GO-V2, TurboFex)
   for (const altEnv of ['set.env', 'config.env']) {
     const altPath = path.join(botDir, altEnv);
-    if (fs.existsSync(altPath) && lines.length > 0) {
-      mergeEnvFile(altPath, map);
+    if (fs.existsSync(altPath)) {
+      mergeEnvFile(altPath, map, options.assignedPort);
     }
   }
 
-  // Sync ELITE-PRO-V1 local database settings/owner JSON when present
+  // Sync TurboFex session_id.txt & config.env when present
+  const sessionTxtPath = path.join(botDir, 'session_id.txt');
+  if (fs.existsSync(sessionTxtPath) && map.SESSION_ID) {
+    try {
+      fs.writeFileSync(sessionTxtPath, `SESSION_ID=${map.SESSION_ID}\n`, 'utf-8');
+      mergeEnvFile(path.join(botDir, 'config.env'), map, options.assignedPort);
+    } catch {
+      // non-fatal TurboFex config sync error
+    }
+  }
+
+  // Sync ELITE-PRO-V1 local database settings/owner JSON when present (ELITE-PRO-V1 ignores .env MODE and defaults to private!)
   if (fs.existsSync(path.join(botDir, 'ElitePro.js'))) {
     try {
       const dbDir = path.join(botDir, 'database');
@@ -708,6 +914,20 @@ export function writeDotEnvFile(botDir: string, envVars: EnvVarEntry[]): void {
       if (map.PREFIX) {
         currentSettings.prefix = map.PREFIX;
       }
+      for (const [envKey, jsonKey] of [
+        ['AUTO_VIEW_STATUS', 'autoviewstatus'],
+        ['AUTO_LIKE_STATUS', 'autolikestatus'],
+        ['AUTO_READ', 'autoread'],
+        ['AUTO_TYPING', 'autoTyping'],
+        ['AUTO_RECORDING', 'autoRecording'],
+        ['AUTO_RECORD_TYPE', 'autorecordtype'],
+        ['AUTO_BIO', 'autobio'],
+        ['AUTO_REACT', 'autoreact'],
+      ] as const) {
+        if (map[envKey] === 'true' || map[envKey] === 'false') {
+          currentSettings[jsonKey] = map[envKey] === 'true';
+        }
+      }
       fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2) + '\n', 'utf-8');
 
       if (map.OWNER_NUMBER) {
@@ -721,14 +941,76 @@ export function writeDotEnvFile(botDir: string, envVars: EnvVarEntry[]): void {
             owners = [];
           }
         }
-        const digits = map.OWNER_NUMBER.replace(/\D/g, '');
-        if (digits && !owners.includes(digits)) {
-          owners.push(digits);
-          fs.writeFileSync(ownerPath, JSON.stringify(owners, null, 2) + '\n', 'utf-8');
+        // Replace default author placeholder if user explicitly set their own owner number(s)
+        const userOwners = map.OWNER_NUMBER.split(',')
+          .map((n) => n.replace(/\D/g, ''))
+          .filter(Boolean);
+        if (userOwners.length > 0) {
+          const mergedOwners = Array.from(
+            new Set([
+              ...owners.filter((n) => n !== '2347047504860' || userOwners.includes('2347047504860')),
+              ...userOwners,
+            ])
+          );
+          fs.writeFileSync(ownerPath, JSON.stringify(mergedOwners, null, 2) + '\n', 'utf-8');
         }
       }
     } catch {
       // ignore non-critical JSON sync error
+    }
+  }
+
+  // Sync silentwolf-bot system/config.js + database/settings.json + optional creds.json
+  const silentwolfConfigPath = path.join(botDir, 'system', 'config.js');
+  if (fs.existsSync(silentwolfConfigPath)) {
+    try {
+      const dbDir = path.join(botDir, 'database');
+      fs.mkdirSync(dbDir, { recursive: true });
+      const settPath = path.join(dbDir, 'settings.json');
+      let currentSettings: Record<string, unknown> = {};
+      if (fs.existsSync(settPath)) {
+        try {
+          currentSettings = JSON.parse(fs.readFileSync(settPath, 'utf-8')) as Record<string, unknown>;
+        } catch {
+          currentSettings = {};
+        }
+      }
+      if (map.MODE) {
+        currentSettings.mode = map.MODE.toLowerCase() === 'private' ? '--self' : '--public';
+      } else if (!currentSettings.mode) {
+        currentSettings.mode = '--public';
+      }
+      fs.writeFileSync(settPath, JSON.stringify(currentSettings, null, 2) + '\n', 'utf-8');
+
+      let cfgText = fs.readFileSync(silentwolfConfigPath, 'utf-8');
+      const pairNum = (map.PAIRING_NUMBER || map.OWNER_NUMBER || '').replace(/\D/g, '');
+      if (pairNum) {
+        cfgText = cfgText
+          .replace(/"62xxxx@s\.whatsapp\.net"/g, JSON.stringify(`${pairNum}@s.whatsapp.net`))
+          .replace(/"62xxxx"/g, JSON.stringify(pairNum));
+      }
+      if (map.BOT_NAME) {
+        cfgText = cfgText.replace(/name:\s*"silentwolf"/g, `name: ${JSON.stringify(map.BOT_NAME)}`);
+      }
+      if (map.PREFIX) {
+        cfgText = cfgText.replace(
+          /prefix:\s*\[\s*"\."\s*,\s*"!"\s*\]/,
+          `prefix: [${JSON.stringify(map.PREFIX)}]`
+        );
+      }
+      fs.writeFileSync(silentwolfConfigPath, cfgText, 'utf-8');
+
+      const sessionRaw = map.SESSION_ID || map.SESSION || '';
+      const authCredsPath = path.join(dbDir, 'auth', 'creds.json');
+      if (sessionRaw && !fs.existsSync(authCredsPath)) {
+        const parsedCreds = tryDecodeBaileysCreds(sessionRaw);
+        if (parsedCreds) {
+          fs.mkdirSync(path.join(dbDir, 'auth'), { recursive: true });
+          fs.writeFileSync(authCredsPath, JSON.stringify(parsedCreds, null, 2), 'utf-8');
+        }
+      }
+    } catch {
+      // ignore non-critical silentwolf sync error
     }
   }
 }

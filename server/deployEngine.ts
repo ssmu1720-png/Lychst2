@@ -12,6 +12,7 @@ import {
 } from './gitRunner.ts';
 import {
   ensureBotsDir,
+  getAssignedBotPort,
   getBotDir,
   isAutoRestarting,
   isRunning,
@@ -31,7 +32,16 @@ const TIER_MEMORY_MB: Record<ComputeTier, number> = {
   cluster: 2048,
 };
 
-const PERSISTENT_DATA_DIRS = ['database', 'data', 'db', 'storage', 'sessions'] as const;
+const PERSISTENT_DATA_DIRS = [
+  'database',
+  'data',
+  'db',
+  'storage',
+  'sessions',
+  'auth',
+  'auth_info',
+  '.wwebjs_auth',
+] as const;
 const ROOT_DATA_FILE_RE =
   /^(?:store\.json|database\.json|baileys_store\.json)$/i;
 const ROOT_DB_EXT_RE =
@@ -213,6 +223,12 @@ export class BotDeploymentEngine {
           itemCount++;
         }
       }
+      const sessionTxt = path.join(botDir, 'session_id.txt');
+      if (fs.existsSync(sessionTxt) && fs.statSync(sessionTxt).isFile()) {
+        ensureBackupDir();
+        fs.copyFileSync(sessionTxt, path.join(candidateDir, 'session_id.txt'));
+        itemCount++;
+      }
     }
 
     try {
@@ -332,8 +348,10 @@ export class BotDeploymentEngine {
           `Cloned ${dep.repoFullName} (${headInfo.branch} @ ${headInfo.commitSha}) into bot_${dep.id}`
         );
 
-        // 4. Write environment files (.env / set.env / config.env)
-        writeDotEnvFile(botDir, dep.settings.envVars);
+        const assignedPort = getAssignedBotPort(dep.numericId);
+
+        // 4. Write environment files (.env / set.env / config.env / session_id.txt / JSON configs)
+        writeDotEnvFile(botDir, dep.settings.envVars, { assignedPort });
         this.appendLog(
           dep,
           'info',
@@ -427,10 +445,36 @@ export class BotDeploymentEngine {
         }
 
         // Re-sync .env right before launch
-        writeDotEnvFile(botDir, dep.settings.envVars);
+        writeDotEnvFile(botDir, dep.settings.envVars, { assignedPort });
 
-        // 8. Start standard supervised child process
+        // 8. Run prestart hook cleanly when startCommand launches node directly without npm start
         const startCmd = resolved.startCommand.trim() || 'npm start';
+        if (!/^(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?start\b/i.test(startCmd)) {
+          const pkgPath = path.join(botDir, 'package.json');
+          if (fs.existsSync(pkgPath)) {
+            try {
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+                scripts?: Record<string, string>;
+              };
+              if (pkg.scripts?.prestart) {
+                this.appendLog(dep, 'info', 'build', `Executing prestart: ${pkg.scripts.prestart}`);
+                await runShellStep(
+                  'npm run prestart',
+                  botDir,
+                  envMap,
+                  120000,
+                  (line) => this.appendLog(dep, 'info', 'build', line),
+                  controller.signal
+                );
+                if (isAborted()) return;
+              }
+            } catch {
+              // ignore prestart check error
+            }
+          }
+        }
+
+        // 9. Start standard supervised child process
         this.appendLog(dep, 'info', 'runtime', `Launching process: ${startCmd}`);
         const bp = startProcess(dep.id, startCmd, {
           numericId: dep.numericId,
@@ -439,7 +483,7 @@ export class BotDeploymentEngine {
           env: envMap,
         });
 
-        const stability = await waitForProcessStability(dep.id, 2200);
+        const stability = await waitForProcessStability(dep.id, 2600);
         if (isAborted()) {
           stopProcess(dep.id);
           return;
@@ -564,7 +608,9 @@ export class BotDeploymentEngine {
               gitToken: token,
             });
             if (cloneRes.ok) {
-              writeDotEnvFile(botDir, dep.settings.envVars);
+              writeDotEnvFile(botDir, dep.settings.envVars, {
+                assignedPort: getAssignedBotPort(dep.numericId),
+              });
               const resolved = resolveDeploymentCommands(botDir, dep.settings);
               dep.settings.installCommand = resolved.installCommand;
               dep.settings.buildCommand = resolved.buildCommand;
@@ -589,7 +635,9 @@ export class BotDeploymentEngine {
 
           if (resumeIds.has(dep.id) && fs.existsSync(botDir)) {
             try {
-              writeDotEnvFile(botDir, dep.settings.envVars);
+              writeDotEnvFile(botDir, dep.settings.envVars, {
+                assignedPort: getAssignedBotPort(dep.numericId),
+              });
               const resolved = resolveDeploymentCommands(botDir, dep.settings);
               const bp = startProcess(dep.id, resolved.startCommand, {
                 numericId: dep.numericId,

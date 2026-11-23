@@ -47,10 +47,11 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'KEITH;;;...', isSecret: true },
+      { key: 'SESSION', label: 'Session ID', placeholder: 'KEITH;;;...', isSecret: true },
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
-      { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
+      { key: 'BOT_MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOTNAME', label: 'Bot Name', placeholder: 'KEITH-MD', isSecret: false },
     ],
   },
   {
@@ -73,9 +74,10 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     startCommand: 'npm start',
     defaultEnvVars: [
       { key: 'SESSION_ID', label: 'Session ID', placeholder: 'GURU~...', isSecret: true },
-      { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
+      { key: 'PREFIXES', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOT_NAME', label: 'Bot Name', placeholder: 'ULTRA-GURU', isSecret: false },
     ],
   },
   {
@@ -98,9 +100,10 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     startCommand: 'npm start',
     defaultEnvVars: [
       { key: 'SESSION_ID', label: 'Session ID', placeholder: 'PANTHER~...', isSecret: true },
-      { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
+      { key: 'PREFIXES', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOT_NAME', label: 'Bot Name', placeholder: 'BLACK-PANTHER', isSecret: false },
     ],
   },
   {
@@ -147,10 +150,12 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'FEE~...', isSecret: true },
+      { key: 'SESSION', label: 'Session ID', placeholder: 'FEE~...', isSecret: true },
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '255...', isSecret: false },
+      { key: 'CODE', label: 'Country Code', placeholder: '255', isSecret: false },
+      { key: 'DEVICE', label: 'Browser Device (Android / iPhone)', placeholder: 'Android', isSecret: false },
     ],
   },
   {
@@ -172,10 +177,11 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'WOLF~...', isSecret: true },
+      { key: 'PAIRING_NUMBER', label: 'Bot Phone / Pairing Number', placeholder: '2547...', isSecret: false },
+      { key: 'SESSION_ID', label: 'Creds JSON / Base64 (Optional)', placeholder: 'Optional creds.json or pair via console', isSecret: true },
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
-      { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOT_NAME', label: 'Bot Name', placeholder: 'silentwolf', isSecret: false },
     ],
   },
   {
@@ -197,7 +203,7 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'CYPHERX~...', isSecret: true },
+      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'XPLOADER-BOT:~...', isSecret: true },
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '234...', isSecret: false },
@@ -222,10 +228,11 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'BWM~...', isSecret: true },
+      { key: 'SESSION', label: 'Session ID', placeholder: 'BWM~...', isSecret: true },
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'DEVICE_MODE', label: 'Device Mode (Android / iPhone)', placeholder: 'Android', isSecret: false },
     ],
   },
   {
@@ -247,10 +254,11 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'SILA~...', isSecret: true },
-      { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
+      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'SILA-BOT:...', isSecret: true },
+      { key: 'BOT_PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOT_NAME', label: 'Bot Name', placeholder: 'SILA-MD', isSecret: false },
     ],
   },
   {
@@ -273,9 +281,10 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     startCommand: 'npm start',
     defaultEnvVars: [
       { key: 'SESSION_ID', label: 'Session ID', placeholder: 'TURBO~...', isSecret: true },
-      { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
+      { key: 'BOT_PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
-      { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2782...', isSecret: false },
+      { key: 'NUMBER', label: 'Owner Number', placeholder: '2782...', isSecret: false },
+      { key: 'TIMEZONE', label: 'Timezone', placeholder: 'Africa/Johannesburg', isSecret: false },
     ],
   },
   {
@@ -322,10 +331,13 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
     buildCommand: '',
     startCommand: 'npm start',
     defaultEnvVars: [
-      { key: 'SESSION_ID', label: 'Session ID', placeholder: 'TOXIC~...', isSecret: true },
+      { key: 'SESSION', label: 'Session ID', placeholder: 'TOXIC~...', isSecret: true },
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOTNAME', label: 'Bot Name', placeholder: 'Toxic-MD', isSecret: false },
+      { key: 'CODE', label: 'Country Code', placeholder: '254', isSecret: false },
+      { key: 'DEVICE', label: 'Browser Device (Android / iPhone)', placeholder: 'Android', isSecret: false },
     ],
   },
   {
@@ -351,6 +363,8 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'DEV', label: 'Owner Number', placeholder: '2547...', isSecret: false },
+      { key: 'BOTNAME', label: 'Bot Name', placeholder: 'KING-MD', isSecret: false },
+      { key: 'CODE', label: 'Country Code', placeholder: '254', isSecret: false },
     ],
   },
   {
@@ -376,6 +390,8 @@ export const TEMPLATE_BOTS: TemplateBotSpec[] = [
       { key: 'PREFIX', label: 'Command Prefix', placeholder: '.', isSecret: false },
       { key: 'MODE', label: 'Bot Mode (public / private)', placeholder: 'public', isSecret: false },
       { key: 'OWNER_NUMBER', label: 'Owner Number', placeholder: '234...', isSecret: false },
+      { key: 'OWNER_NAME', label: 'Owner Name', placeholder: 'ElitePro', isSecret: false },
+      { key: 'BOT_NAME', label: 'Bot Name', placeholder: 'ELITE-PRO-V1', isSecret: false },
     ],
   },
 ];
