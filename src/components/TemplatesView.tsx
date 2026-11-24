@@ -7,6 +7,7 @@ import {
   ExternalLink,
   GitBranch,
   Github,
+  Globe,
   KeyRound,
   Layers,
   Rocket,
@@ -61,6 +62,7 @@ export function TemplatesView({
   const [restartPolicy, setRestartPolicy] = useState<RestartPolicy>(preferences.defaultRestartPolicy);
   const [installCmd, setInstallCmd] = useState('npm install --legacy-peer-deps --ignore-engines');
   const [startCmd, setStartCmd] = useState('npm start');
+  const [customDomain, setCustomDomain] = useState('');
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
 
   const [deploying, setDeploying] = useState(false);
@@ -118,6 +120,7 @@ export function TemplatesView({
       initialEnv[field.key] = field.key === 'PREFIX' ? '.' : field.key === 'MODE' ? 'public' : '';
     }
     setEnvValues(initialEnv);
+    setCustomDomain('');
     setDeployError(null);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -174,6 +177,12 @@ export function TemplatesView({
           framework: selectedTemplate.framework,
           commitSha: 'head',
           planId: selectedPlan.id,
+          ...(customDomain.trim() &&
+          (selectedTemplate.runtime === 'node-20' ||
+            selectedTemplate.runtime === 'node-22' ||
+            selectedTemplate.runtime === 'bun-1')
+            ? { customDomain: customDomain.trim() }
+            : {}),
           settings,
           scanReport: null,
         }),
@@ -463,6 +472,29 @@ export function TemplatesView({
                 </select>
               </div>
             </div>
+
+            {(selectedTemplate.runtime === 'node-20' ||
+              selectedTemplate.runtime === 'node-22' ||
+              selectedTemplate.runtime === 'bun-1') && (
+              <div className="border-t border-red-950/70 pt-4 space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                    <Globe className="h-3.5 w-3.5 text-red-400" />
+                    Custom Domain (Optional · Node.js / Bun)
+                  </label>
+                  <span className="font-mono text-[10px] text-slate-400">
+                    Leave empty for auto Railway link, or add/change anytime under Domains
+                  </span>
+                </div>
+                <input
+                  type="text"
+                  value={customDomain}
+                  onChange={(e) => setCustomDomain(e.target.value)}
+                  placeholder="bot.yourdomain.com or extra-bot.up.railway.app"
+                  className="w-full rounded-md border border-red-950/90 bg-[#080305] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
+                />
+              </div>
+            )}
 
             {deployError && (
               <div className="flex items-start gap-2 rounded-md border border-red-500/50 bg-red-500/15 p-3 text-xs text-red-200">

@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getDeploymentPlan, getMeta, getUserById } from './db.ts';
+import {
+  buildDeploymentNetworkingInfo,
+  normalizeHostname,
+  supportsPublicEndpoints,
+} from './appProxy.ts';
+import { detectEnvRailwayDomain, getDeploymentPlan, getMeta, getUserById } from './db.ts';
 import { sendDeploymentSuccessEmail } from './emailService.ts';
 import {
   buildEnvMap,
@@ -22,7 +27,13 @@ import {
   stopProcessAndWait,
   waitForProcessStability,
 } from './processManager.ts';
-import { nowIso, pushDeploymentLog, type PersistedState } from './stateStore.ts';
+import {
+  generateMonitorToken,
+  generateUniqueAppSlug,
+  nowIso,
+  pushDeploymentLog,
+  type PersistedState,
+} from './stateStore.ts';
 import type { BotDeployment, ComputeTier, LogEntry } from '../src/types/lyrihost.ts';
 
 const TIER_MEMORY_MB: Record<ComputeTier, number> = {
@@ -109,12 +120,104 @@ export class BotDeploymentEngine {
     this.ctx.broadcast();
   }
 
+  private resolveDeploymentLinks(dep: BotDeployment) {
+    const state = this.ctx.getState();
+    const isNode = supportsPublicEndpoints(dep);
+    if (isNode) {
+      if (!dep.appSlug) {
+        dep.appSlug = generateUniqueAppSlug(dep.name, state.deployments, dep.id);
+      }
+      if (!dep.monitorToken) {
+        dep.monitorToken = generateMonitorToken();
+      }
+      if (dep.publicAppEnabled === undefined) {
+        dep.publicAppEnabled = true;
+      }
+    }
+
+    const prefRailway = state.preferences.railwayDomain
+      ? normalizeHostname(state.preferences.railwayDomain)
+      : null;
+    const envRailway = normalizeHostname(detectEnvRailwayDomain());
+    const learnedOrigin = getMeta('public_keepalive_origin') || '';
+    let learnedRailway: string | null = null;
+    if (learnedOrigin) {
+      try {
+        const h = normalizeHostname(new URL(learnedOrigin).hostname);
+        if (h && h.endsWith('.up.railway.app')) learnedRailway = h;
+      } catch {
+        // ignore invalid URL
+      }
+    }
+
+    const railwayDomain = prefRailway || envRailway || learnedRailway || '';
+    const railwayDomainSource = prefRailway
+      ? 'preference'
+      : envRailway
+        ? 'env'
+        : learnedRailway
+          ? 'detected'
+          : 'none';
+
+    const rawOrigin =
+      (railwayDomain ? `https://${railwayDomain}` : '') ||
+      process.env.APP_URL?.trim() ||
+      process.env.PUBLIC_URL?.trim() ||
+      process.env.RENDER_EXTERNAL_URL?.trim() ||
+      learnedOrigin ||
+      '';
+
+    const origin = /^https?:\/\//i.test(rawOrigin) ? rawOrigin.replace(/\/+$/, '') : '';
+    let serverHost = railwayDomain;
+    if (!serverHost && origin) {
+      try {
+        serverHost = new URL(origin).hostname;
+      } catch {
+        serverHost = '';
+      }
+    }
+
+    const wildcard =
+      normalizeHostname(
+        state.preferences.platformWildcardDomain || process.env.APP_WILDCARD_DOMAIN || ''
+      ) || '';
+
+    const networking = buildDeploymentNetworkingInfo({
+      dep,
+      origin,
+      serverHost,
+      railwayDomain,
+      railwayDomainSource,
+      platformWildcardDomain: wildcard,
+    });
+
+    return {
+      dashboardUrl: origin || null,
+      networking,
+    };
+  }
+
   private notifyDeployer(
     dep: BotDeployment,
     startCmd: string,
     pid: number,
     envVarCount: number
   ): void {
+    const { dashboardUrl, networking } = this.resolveDeploymentLinks(dep);
+
+    if (networking.supported && networking.publicAppEnabled) {
+      const primaryLink =
+        networking.customDomainUrl || networking.pathAppUrl || networking.subdomainAppUrl;
+      if (primaryLink) {
+        pushDeploymentLog(dep, 'success', 'runtime', `Public App URL: ${primaryLink}`);
+      }
+      if (networking.uptimeMonitorUrl) {
+        pushDeploymentLog(dep, 'info', 'runtime', `UptimeRobot URL: ${networking.uptimeMonitorUrl}`);
+      }
+      this.ctx.saveState();
+      this.ctx.broadcast();
+    }
+
     const recipientEmail =
       dep.ownerEmail?.trim() ||
       (dep.ownerUserId ? getUserById(dep.ownerUserId)?.email?.trim() : '') ||
@@ -129,21 +232,6 @@ export class BotDeploymentEngine {
     } catch {
       // keep fallback label
     }
-
-    const rawDashboard =
-      process.env.APP_URL?.trim() ||
-      process.env.PUBLIC_URL?.trim() ||
-      process.env.RENDER_EXTERNAL_URL?.trim() ||
-      (process.env.RAILWAY_STATIC_URL?.trim()
-        ? `https://${process.env.RAILWAY_STATIC_URL.trim().replace(/^https?:\/\//i, '')}`
-        : '') ||
-      (process.env.RAILWAY_PUBLIC_DOMAIN?.trim()
-        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim().replace(/^https?:\/\//i, '')}`
-        : '') ||
-      getMeta('public_keepalive_origin') ||
-      '';
-
-    const dashboardUrl = /^https?:\/\//i.test(rawDashboard) ? rawDashboard : null;
 
     void sendDeploymentSuccessEmail({
       toEmail: recipientEmail,
@@ -165,11 +253,15 @@ export class BotDeploymentEngine {
       envVarCount,
       deployedAt: dep.lastDeployedAt || nowIso(),
       dashboardUrl,
+      appUrl: networking.pathAppUrl,
+      subdomainUrl: networking.subdomainAppUrl,
+      customDomainUrl: networking.customDomainUrl,
+      uptimeMonitorUrl: networking.uptimeMonitorUrl,
     })
       .then((result) => {
         if (!this.ctx.getState().deployments.some((d) => d.id === dep.id)) return;
         if (result.ok) {
-          this.appendLog(dep, 'info', 'notify', `Deployment details sent to ${recipientEmail}.`);
+          this.appendLog(dep, 'info', 'notify', `Deployment details & live link sent to ${recipientEmail}.`);
         } else {
           this.appendLog(
             dep,

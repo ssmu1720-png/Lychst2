@@ -488,22 +488,22 @@ export function PlatformSettingsView({
                 <div className="flex items-center gap-2">
                   <Globe className="h-3.5 w-3.5 text-emerald-400" />
                   <span className="text-xs font-semibold text-slate-100">
-                    Railway Service Domain (Node Apps &amp; Bots)
+                    App Custom Domain / Railway Domain
                   </span>
                 </div>
                 <span className="font-mono text-[10px] text-emerald-300">
-                  *.up.railway.app
+                  custom domain or *.up.railway.app
                 </span>
               </div>
               <input
                 type="text"
                 value={railwayDomain}
                 onChange={(e) => setRailwayDomain(e.target.value)}
-                placeholder="lyrihost-production.up.railway.app"
+                placeholder="app.yourdomain.com or lyrihost-production.up.railway.app"
                 className="w-full rounded-md border border-red-950/80 bg-[#080305] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-emerald-400 focus:outline-none"
               />
               <p className="text-[11px] text-slate-400">
-                Auto-detected from <code className="font-mono text-emerald-300">RAILWAY_PUBLIC_DOMAIN</code> when deployed on Railway, or enter your <code className="font-mono text-slate-300">.up.railway.app</code> domain here. All Node app links (<code className="font-mono text-rose-300">/app/&lt;slug&gt;/</code>), UptimeRobot URLs, and DNS CNAME instructions use this domain.
+                Add your custom domain (or keep your auto-detected <code className="font-mono text-emerald-300">RAILWAY_PUBLIC_DOMAIN</code>) for the app here. All generated Node app links (<code className="font-mono text-rose-300">/app/&lt;slug&gt;/</code>), deployment emails, UptimeRobot monitors, and DNS CNAME targets use this domain.
               </p>
             </div>
 

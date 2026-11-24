@@ -260,7 +260,7 @@ function BotHealthIndicator({
           />
         </div>
         <div className="mt-1 font-mono text-[10px] text-slate-400 tabular-nums">
-          {isOnline ? `${health.latencyMs}ms` : '—'} · {health.memPct}% RAM · {health.uptimePct.toFixed(1)}% up
+          {isOnline ? `${dep.cpuPercent.toFixed(1)}% CPU` : '—'} · {dep.memoryMb}MB ({health.memPct}%) · {isOnline ? `${health.latencyMs}ms` : '—'}
         </div>
       </div>
     );
@@ -299,21 +299,27 @@ function BotHealthIndicator({
         />
       </div>
 
-      <div className="mt-2.5 grid grid-cols-3 gap-2 font-mono text-[10px] tabular-nums">
+      <div className="mt-2.5 grid grid-cols-4 gap-2 font-mono text-[10px] tabular-nums">
         <div>
-          <span className="block text-slate-500">LATENCY</span>
-          <span className="text-rose-300">
-            {isOnline && health.latencyMs > 0 ? `${health.latencyMs} ms` : '—'}
+          <span className="block text-slate-500">CPU</span>
+          <span className="text-red-300 font-semibold">
+            {isOnline ? `${dep.cpuPercent.toFixed(1)}%` : '0.0%'}
           </span>
         </div>
         <div>
-          <span className="block text-slate-500">MEMORY</span>
+          <span className="block text-slate-500">RAM</span>
           <span className="text-slate-200">
-            {dep.memoryMb} MB <span className="text-slate-500">({health.memPct}%)</span>
+            {dep.memoryMb}MB <span className="text-slate-500">({health.memPct}%)</span>
+          </span>
+        </div>
+        <div>
+          <span className="block text-slate-500">PING</span>
+          <span className="text-rose-300">
+            {isOnline && health.latencyMs > 0 ? `${health.latencyMs}ms` : '—'}
           </span>
         </div>
         <div className="text-right">
-          <span className="block text-slate-500">UPTIME %</span>
+          <span className="block text-slate-500">UPTIME</span>
           <span className="text-slate-200">{health.uptimePct.toFixed(1)}%</span>
         </div>
       </div>
@@ -727,6 +733,8 @@ export function DashboardView({
                           <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-slate-500 opacity-0 transition-opacity group-hover:opacity-100 group-hover:text-red-400" />
                         </div>
                         <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                          <span className="font-mono text-rose-300/90">{dep.id}</span>
+                          <span aria-hidden="true">·</span>
                           <span>{dep.framework}</span>
                           <span aria-hidden="true">·</span>
                           <span className="font-mono">{dep.settings.region}</span>
@@ -911,7 +919,8 @@ export function DashboardView({
                     <th className="py-2.5 pl-4 pr-2">Service</th>
                     <th className="px-2 py-2.5">Status</th>
                     <th className="px-2 py-2.5">Health Score</th>
-                    <th className="px-2 py-2.5 text-right">Memory</th>
+                    <th className="px-2 py-2.5 text-right">CPU</th>
+                    <th className="px-2 py-2.5 text-right">RAM</th>
                     <th className="px-2 py-2.5 text-right">Latency</th>
                     <th className="px-2 py-2.5 text-right">Uptime</th>
                     <th className="py-2.5 pl-2 pr-4 text-right">Controls</th>
@@ -930,7 +939,7 @@ export function DashboardView({
                         <td className="py-2.5 pl-4 pr-2">
                           <div className="font-medium text-slate-100">{dep.name}</div>
                           <div className="font-mono text-[10px] text-rose-300/90">
-                            {dep.repoFullName} · {dep.settings.branch}
+                            {dep.id} · {dep.repoFullName} · {dep.settings.branch}
                           </div>
                         </td>
                         <td className="px-2 py-2.5">
@@ -938,6 +947,9 @@ export function DashboardView({
                         </td>
                         <td className="px-2 py-2.5">
                           <BotHealthIndicator dep={dep} streamConnected={streamConnected} compact />
+                        </td>
+                        <td className="px-2 py-2.5 text-right font-mono text-[11px] text-red-300 tabular-nums font-semibold">
+                          {dep.status === 'online' ? `${dep.cpuPercent.toFixed(1)}%` : '0.0%'}
                         </td>
                         <td className="px-2 py-2.5 text-right font-mono text-[11px] text-slate-300 tabular-nums">
                           <div>{dep.memoryMb}/{dep.memoryLimitMb} MB</div>

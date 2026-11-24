@@ -560,6 +560,76 @@ export function sendRawInput(botId: string, rawData: string): boolean {
 }
 
 const statsCache = new Map<number, { value: { cpuPercent: number; memoryMb: number } | null; expiresAt: number }>();
+const prevProcCpuSample = new Map<number, { totalJiffies: number; sampledAtMs: number }>();
+
+function sampleLinuxProcGroupSync(rootPid: number): { cpuPercent: number; memoryMb: number } | null {
+  if (process.platform !== 'linux' || !fs.existsSync(`/proc/${rootPid}/stat`)) {
+    return null;
+  }
+
+  try {
+    const statEntries = fs.readdirSync('/proc', { withFileTypes: true });
+    let totalJiffies = 0;
+    let totalRssKb = 0;
+    let matchedCount = 0;
+
+    const rootStat = fs.readFileSync(`/proc/${rootPid}/stat`, 'utf-8');
+    const rootRparen = rootStat.lastIndexOf(')');
+    if (rootRparen === -1) return null;
+    const rootRest = rootStat.slice(rootRparen + 2).split(/\s+/);
+    const rootPgrp = Number.parseInt(rootRest[2] || '0', 10) || rootPid;
+
+    for (const entry of statEntries) {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+      const pidNum = Number.parseInt(entry.name, 10);
+      try {
+        const statStr = fs.readFileSync(`/proc/${pidNum}/stat`, 'utf-8');
+        const rparen = statStr.lastIndexOf(')');
+        if (rparen === -1) continue;
+        const fields = statStr.slice(rparen + 2).split(/\s+/);
+        // fields[0]=state, [1]=ppid, [2]=pgrp, [11]=utime, [12]=stime, [13]=cutime, [14]=cstime
+        const pgrp = Number.parseInt(fields[2] || '0', 10);
+        const ppid = Number.parseInt(fields[1] || '0', 10);
+        if (pidNum !== rootPid && pgrp !== rootPgrp && ppid !== rootPid) continue;
+
+        matchedCount += 1;
+        const utime = Number.parseInt(fields[11] || '0', 10) || 0;
+        const stime = Number.parseInt(fields[12] || '0', 10) || 0;
+        totalJiffies += utime + stime;
+
+        const statusStr = fs.readFileSync(`/proc/${pidNum}/status`, 'utf-8');
+        const rssMatch = statusStr.match(/^VmRSS:\s+(\d+)\s+kB/m);
+        if (rssMatch) {
+          totalRssKb += Number.parseInt(rssMatch[1], 10) || 0;
+        }
+      } catch {
+        // process may have exited mid-scan
+      }
+    }
+
+    if (matchedCount === 0) return null;
+
+    const nowMs = Date.now();
+    const prev = prevProcCpuSample.get(rootPid);
+    prevProcCpuSample.set(rootPid, { totalJiffies, sampledAtMs: nowMs });
+
+    let cpuPercent = 0;
+    if (prev && nowMs > prev.sampledAtMs && totalJiffies >= prev.totalJiffies) {
+      const deltaSec = (nowMs - prev.sampledAtMs) / 1000;
+      const deltaJiffies = totalJiffies - prev.totalJiffies;
+      // Linux user_hz is 100 jiffies/sec on standard x86_64/arm64 containers
+      const clkTck = 100;
+      cpuPercent = Math.min(400, Math.max(0, (deltaJiffies / clkTck / deltaSec) * 100));
+    }
+
+    return {
+      cpuPercent: Number(cpuPercent.toFixed(1)),
+      memoryMb: Math.max(0, Math.round(totalRssKb / 1024)),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export function sampleProcessStats(
   pid: number,
@@ -578,6 +648,15 @@ export function sampleProcessStats(
         return;
       }
     }
+
+    // Prefer true real-time delta CPU% + RSS RAM from Linux /proc
+    const linuxLive = sampleLinuxProcGroupSync(pid);
+    if (linuxLive) {
+      statsCache.set(pid, { value: linuxLive, expiresAt: now + 900 });
+      resolve(linuxLive);
+      return;
+    }
+
     const args =
       process.platform === 'linux'
         ? ['--no-headers', '-o', '%cpu=,rss=', '-g', String(pid)]
@@ -588,18 +667,19 @@ export function sampleProcessStats(
         // Fallback to single PID query if process group query returns empty
         execFile('ps', ['-p', String(pid), '-o', '%cpu=,rss='], { timeout: 1000 }, (err2, out2) => {
           if (err2 || !out2.trim()) {
-            statsCache.set(pid, { value: null, expiresAt: Date.now() + 4500 });
+            prevProcCpuSample.delete(pid);
+            statsCache.set(pid, { value: null, expiresAt: Date.now() + 900 });
             resolve(null);
             return;
           }
           const parsed = parsePsOutput(out2);
-          statsCache.set(pid, { value: parsed, expiresAt: Date.now() + 4500 });
+          statsCache.set(pid, { value: parsed, expiresAt: Date.now() + 900 });
           resolve(parsed);
         });
         return;
       }
       const parsed = parsePsOutput(stdout);
-      statsCache.set(pid, { value: parsed, expiresAt: Date.now() + 4500 });
+      statsCache.set(pid, { value: parsed, expiresAt: Date.now() + 900 });
       resolve(parsed);
     });
   });

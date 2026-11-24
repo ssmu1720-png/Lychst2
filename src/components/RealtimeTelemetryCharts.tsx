@@ -33,7 +33,7 @@ export function RealtimeFleetChart({
   lastSyncTime,
 }: RealtimeFleetChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [metricMode, setMetricMode] = useState<'throughput' | 'cpu' | 'latency'>('throughput');
+  const [metricMode, setMetricMode] = useState<'throughput' | 'cpu' | 'ram' | 'latency'>('cpu');
 
   const series = useMemo<FleetSeriesPoint[]>(() => {
     const sampleCount = 28;
@@ -84,11 +84,13 @@ export function RealtimeFleetChart({
       ? p.totalEventsPerMin
       : metricMode === 'cpu'
         ? p.totalCpu
-        : p.avgLatencyMs
+        : metricMode === 'ram'
+          ? p.totalMemoryMb
+          : p.avgLatencyMs
   );
 
   const maxVal = Math.max(
-    metricMode === 'cpu' ? 10 : metricMode === 'latency' ? 60 : 120,
+    metricMode === 'cpu' ? 10 : metricMode === 'ram' ? 128 : metricMode === 'latency' ? 60 : 120,
     ...values.map((v) => v * 1.25)
   );
 
@@ -140,8 +142,9 @@ export function RealtimeFleetChart({
         <div className="flex items-center gap-0.5 rounded-md border border-red-950/80 bg-[#080305] p-0.5">
           {(
             [
-              { id: 'throughput', label: 'Events/m' },
               { id: 'cpu', label: 'CPU %' },
+              { id: 'ram', label: 'RAM MB' },
+              { id: 'throughput', label: 'Events/m' },
               { id: 'latency', label: 'Ping ms' },
             ] as const
           ).map((tab) => (
@@ -301,5 +304,83 @@ export function MiniSparkline({ values, active }: { values: number[]; active: bo
         points={pts.join(' ')}
       />
     </svg>
+  );
+}
+
+export function BotCpuRamRealtimeChart({ deployment }: { deployment: BotDeployment }) {
+  const history = (deployment.telemetryHistory || []).slice(-28);
+  const width = 460;
+  const height = 74;
+  const padX = 4;
+  const padY = 6;
+
+  const cpuValues = history.map((h) => h.cpuPercent);
+  const ramValues = history.map((h) => h.memoryMb);
+
+  const maxCpu = Math.max(10, ...cpuValues.map((v) => v * 1.25));
+  const maxRam = Math.max(deployment.memoryLimitMb || 256, ...ramValues.map((v) => v * 1.15));
+
+  const buildPath = (vals: number[], maxV: number) =>
+    vals
+      .map((val, idx) => {
+        const x = padX + (idx / Math.max(1, vals.length - 1)) * (width - padX * 2);
+        const y = height - padY - (val / maxV) * (height - padY * 2);
+        return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+      })
+      .join(' ');
+
+  const cpuPath = history.length > 1 ? buildPath(cpuValues, maxCpu) : '';
+  const ramPath = history.length > 1 ? buildPath(ramValues, maxRam) : '';
+
+  return (
+    <div className="rounded-lg border border-red-950/80 bg-[#0a0406] p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] mb-1.5">
+        <span className="font-semibold text-slate-200">
+          Realtime CPU &amp; RAM Consumption
+        </span>
+        <div className="flex items-center gap-3 font-mono text-[10px] tabular-nums">
+          <span className="inline-flex items-center gap-1 text-red-300">
+            <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
+            CPU {deployment.cpuPercent.toFixed(1)}%
+          </span>
+          <span className="inline-flex items-center gap-1 text-emerald-300">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+            RAM {deployment.memoryMb} MB / {deployment.memoryLimitMb} MB
+          </span>
+        </div>
+      </div>
+
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-16 w-full overflow-visible">
+        <line
+          x1={padX}
+          y1={height / 2}
+          x2={width - padX}
+          y2={height / 2}
+          stroke="rgba(127,29,29,0.3)"
+          strokeDasharray="3 3"
+          strokeWidth="1"
+        />
+        {ramPath && (
+          <path
+            d={ramPath}
+            fill="none"
+            stroke="#34d399"
+            strokeWidth="1.5"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+        )}
+        {cpuPath && (
+          <path
+            d={cpuPath}
+            fill="none"
+            stroke="#f87171"
+            strokeWidth="1.75"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+        )}
+      </svg>
+    </div>
   );
 }

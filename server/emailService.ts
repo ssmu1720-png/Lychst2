@@ -916,41 +916,78 @@ export interface DeploymentSuccessEmailParams {
   envVarCount: number;
   deployedAt: string;
   dashboardUrl?: string | null;
+  appUrl?: string | null;
+  subdomainUrl?: string | null;
+  customDomainUrl?: string | null;
+  uptimeMonitorUrl?: string | null;
 }
 
 export async function sendDeploymentSuccessEmail(
   params: DeploymentSuccessEmailParams
 ): Promise<{ ok: boolean; id?: string; provider?: string; error?: string }> {
-  const rows: Array<[string, string]> = [
-    ['Bot Name', params.botName],
-    ['Deployment ID', params.deploymentId],
-    ['Status', 'ONLINE · 24/7 Active'],
-    ['Platform / Framework', `${params.platform} · ${params.framework}`],
-    ['Repository', `${params.repoFullName} (${params.branch} @ ${params.commitSha})`],
-    ['Region / Tier', `${params.region} · ${params.computeTier.toUpperCase()} (${params.memoryLimitMb} MB RAM)`],
-    ['Hosting Plan', params.planName],
-    ['Plan Expires', params.expiresAt ? new Date(params.expiresAt).toUTCString() : 'Unlimited / No Expiry'],
-    ['Runtime / PID', `${params.runtime} · PID ${params.pid}`],
-    ['Start Command', params.startCommand],
-    ['Env Variables', `${params.envVarCount} configured (values redacted for security)`],
-    ['Deployed At', new Date(params.deployedAt).toUTCString()],
+  const rows: Array<{ label: string; value: string; href?: string }> = [
+    { label: 'Bot / App Name', value: params.botName },
+    { label: 'Deployment ID', value: params.deploymentId },
+    { label: 'Status', value: 'ONLINE · 24/7 Active' },
+    ...(params.customDomainUrl
+      ? [{ label: 'Custom Domain URL', value: params.customDomainUrl, href: params.customDomainUrl }]
+      : []),
+    ...(params.appUrl
+      ? [{ label: 'Live Public URL', value: params.appUrl, href: params.appUrl }]
+      : []),
+    ...(params.subdomainUrl
+      ? [{ label: 'Subdomain URL', value: params.subdomainUrl, href: params.subdomainUrl }]
+      : []),
+    ...(params.uptimeMonitorUrl
+      ? [{ label: 'UptimeRobot Link', value: params.uptimeMonitorUrl, href: params.uptimeMonitorUrl }]
+      : []),
+    { label: 'Platform / Framework', value: `${params.platform} · ${params.framework}` },
+    { label: 'Repository', value: `${params.repoFullName} (${params.branch} @ ${params.commitSha})` },
+    {
+      label: 'Region / Tier',
+      value: `${params.region} · ${params.computeTier.toUpperCase()} (${params.memoryLimitMb} MB RAM)`,
+    },
+    { label: 'Hosting Plan', value: params.planName },
+    {
+      label: 'Plan Expires',
+      value: params.expiresAt ? new Date(params.expiresAt).toUTCString() : 'Unlimited / No Expiry',
+    },
+    { label: 'Runtime / PID', value: `${params.runtime} · PID ${params.pid}` },
+    { label: 'Start Command', value: params.startCommand },
+    { label: 'Env Variables', value: `${params.envVarCount} configured (values redacted for security)` },
+    { label: 'Deployed At', value: new Date(params.deployedAt).toUTCString() },
   ];
 
   const rowsHtml = rows
     .map(
-      ([label, value]) => `
+      ({ label, value, href }) => `
         <tr>
           <td style="padding:8px 10px; border-bottom:1px solid #2a0a10; font-size:12px; color:#94a3b8; white-space:nowrap; vertical-align:top;">${escapeHtml(label)}</td>
-          <td style="padding:8px 10px; border-bottom:1px solid #2a0a10; font-size:13px; color:#f8fafc; font-family:'IBM Plex Mono', ui-monospace, monospace; word-break:break-word;">${escapeHtml(value)}</td>
+          <td style="padding:8px 10px; border-bottom:1px solid #2a0a10; font-size:13px; color:#f8fafc; font-family:'IBM Plex Mono', ui-monospace, monospace; word-break:break-word;">${
+            href
+              ? `<a href="${escapeHtml(href)}" style="color:#6ee7b7; text-decoration:underline;">${escapeHtml(value)}</a>`
+              : escapeHtml(value)
+          }</td>
         </tr>`
     )
     .join('');
 
-  const ctaHtml = params.dashboardUrl
-    ? `<div style="margin-top:22px; text-align:center;">
-         <a href="${escapeHtml(params.dashboardUrl)}" style="display:inline-block; background:#dc2626; color:#ffffff; text-decoration:none; font-size:13px; font-weight:700; padding:11px 22px; border-radius:6px;">Open Lyrihost Console</a>
-       </div>`
-    : '';
+  const primaryLiveUrl = params.customDomainUrl || params.appUrl || params.subdomainUrl || null;
+  const ctaHtml =
+    primaryLiveUrl || params.dashboardUrl
+      ? `<div style="margin-top:22px; text-align:center;">
+           ${
+             primaryLiveUrl
+               ? `<a href="${escapeHtml(primaryLiveUrl)}" style="display:inline-block; background:#059669; color:#ffffff; text-decoration:none; font-size:13px; font-weight:700; padding:11px 22px; border-radius:6px; margin:4px;">Open Live App</a>`
+               : ''
+           }
+           ${
+             params.dashboardUrl
+               ? `<a href="${escapeHtml(params.dashboardUrl)}" style="display:inline-block; background:#dc2626; color:#ffffff; text-decoration:none; font-size:13px; font-weight:700; padding:11px 22px; border-radius:6px; margin:4px;">Open Lyrihost Console</a>`
+               : ''
+           }
+         </div>`
+      : '';
 
   const html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#080305; color:#e2e8f0; padding:32px 24px; border:1px solid #450a0a; border-radius:10px; max-width:600px; margin:0 auto;">
@@ -959,7 +996,7 @@ export async function sendDeploymentSuccessEmail(
       </div>
       <h1 style="font-size:22px; color:#f8fafc; margin:0 0 10px 0;">${escapeHtml(params.botName)} is now online</h1>
       <p style="font-size:14px; color:#cbd5e1; line-height:1.55; margin:0 0 20px 0;">
-        Your deployment completed cleanly and is running 24/7 under process supervision. Below are your live deployment details.
+        Your deployment completed cleanly and is running 24/7 under process supervision. Below are your live deployment links and runtime details.
       </p>
       <table style="width:100%; border-collapse:collapse; background:#120509; border:1px solid #3f0d16; border-radius:8px; overflow:hidden;">
         <tbody>
@@ -977,8 +1014,9 @@ export async function sendDeploymentSuccessEmail(
   const text = [
     `LYRIHOST DEPLOYMENT LIVE — ${params.botName}`,
     '',
-    ...rows.map(([k, v]) => `${k}: ${v}`),
-    ...(params.dashboardUrl ? ['', `Console: ${params.dashboardUrl}`] : []),
+    ...rows.map((r) => `${r.label}: ${r.value}`),
+    ...(primaryLiveUrl ? ['', `Live App URL: ${primaryLiveUrl}`] : []),
+    ...(params.dashboardUrl ? [`Console: ${params.dashboardUrl}`] : []),
     '',
     'Lyrihost Cloud Bot Hosting Platform',
   ].join('\n');

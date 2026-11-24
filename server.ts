@@ -1621,7 +1621,7 @@ async function startServer() {
           ? 'plan_30d'
           : 'plan_15d');
 
-    const botId = makeId('bot');
+    const botId = makeId('lyr');
     let billingResult;
     try {
       billingResult = spendCoinsForDeployment({

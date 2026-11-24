@@ -21,6 +21,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { EnvVarsEditor } from './EnvVarsEditor';
+import { BotCpuRamRealtimeChart } from './RealtimeTelemetryCharts';
 import {
   DEPLOY_REGIONS,
   type BotDeployment,
@@ -85,6 +86,7 @@ export function BotInspectorView({
   const [networking, setNetworking] = useState<DeploymentNetworkingInfo | null>(null);
   const [domainInput, setDomainInput] = useState(deployment.customDomain || '');
   const [domainBusy, setDomainBusy] = useState(false);
+  const [inlineDomainOpen, setInlineDomainOpen] = useState(false);
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [dnsCheckResult, setDnsCheckResult] = useState<{ verified: boolean; message: string } | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -392,6 +394,9 @@ export function BotInspectorView({
                 )}
                 <span className="capitalize">{deployment.status}</span>
               </span>
+              <span className="rounded border border-red-950/90 bg-[#0a0406] px-2 py-0.5 font-mono text-[11px] text-rose-300">
+                {deployment.id}
+              </span>
             </div>
 
             <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
@@ -481,45 +486,159 @@ export function BotInspectorView({
           </div>
         </div>
 
-        {/* Telemetry Bars */}
-        <div className="mt-5 grid grid-cols-1 gap-4 border-t border-red-950/70 pt-4 sm:grid-cols-3">
-          <div>
-            <div className="flex items-center justify-between text-xs text-slate-400">
-              <span>CPU Utilization</span>
-              <span className="font-mono text-red-300 tabular-nums">
-                {deployment.cpuPercent.toFixed(1)}%
-              </span>
+        {/* Telemetry Bars + Live CPU/RAM Waveform */}
+        <div className="mt-5 space-y-4 border-t border-red-950/70 pt-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div>
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span className="inline-flex items-center gap-1.5">
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      deployment.status === 'online' ? 'bg-red-400 animate-pulse' : 'bg-slate-600'
+                    }`}
+                  />
+                  Realtime CPU
+                </span>
+                <span className="font-mono text-red-300 font-semibold tabular-nums">
+                  {deployment.cpuPercent.toFixed(1)}%
+                </span>
+              </div>
+              <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-red-950/80">
+                <div
+                  className="h-full bg-red-500 transition-all duration-300"
+                  style={{ width: `${Math.min(100, deployment.cpuPercent)}%` }}
+                />
+              </div>
             </div>
-            <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-red-950/80">
-              <div
-                className="h-full bg-red-500 transition-all duration-300"
-                style={{ width: `${Math.min(100, deployment.cpuPercent * 4)}%` }}
-              />
+
+            <div>
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span className="inline-flex items-center gap-1.5">
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      deployment.status === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'
+                    }`}
+                  />
+                  Realtime RAM
+                </span>
+                <span className="font-mono text-emerald-300 font-semibold tabular-nums">
+                  {deployment.memoryMb} / {deployment.memoryLimitMb} MB ({memPct}%)
+                </span>
+              </div>
+              <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-red-950/80">
+                <div
+                  className="h-full bg-emerald-500 transition-all duration-300"
+                  style={{ width: `${memPct}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border border-red-950/80 bg-[#0a0406] px-3.5 py-2 text-xs">
+              <span className="text-slate-400">Start Command</span>
+              <span className="truncate pl-3 font-mono text-slate-200 max-w-[220px]">
+                {deployment.settings.startCommand}
+              </span>
             </div>
           </div>
 
-          <div>
-            <div className="flex items-center justify-between text-xs text-slate-400">
-              <span>Memory Usage</span>
-              <span className="font-mono text-rose-300 tabular-nums">
-                {deployment.memoryMb} / {deployment.memoryLimitMb} MB ({memPct}%)
-              </span>
-            </div>
-            <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-red-950/80">
-              <div
-                className="h-full bg-rose-500 transition-all duration-300"
-                style={{ width: `${memPct}%` }}
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between rounded-lg border border-red-950/80 bg-[#0a0406] px-3.5 py-2 text-xs">
-            <span className="text-slate-400">Start Command</span>
-            <span className="truncate pl-3 font-mono text-slate-200 max-w-[220px]">
-              {deployment.settings.startCommand}
-            </span>
-          </div>
+          <BotCpuRamRealtimeChart deployment={deployment} />
         </div>
+
+        {isNodeDeployment &&
+          networking?.publicAppEnabled !== false &&
+          (networking?.customDomainUrl || networking?.pathAppUrl) && (
+            <div className="mt-4 space-y-2.5 rounded-lg border border-emerald-500/30 bg-[#0a0406] px-3.5 py-2.5">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex min-w-0 items-center gap-2 text-xs">
+                  <Link2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  <span className="font-semibold text-slate-200 shrink-0">Live URL:</span>
+                  <a
+                    href={networking.customDomainUrl || networking.pathAppUrl!}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="truncate font-mono text-emerald-300 hover:underline"
+                  >
+                    {networking.customDomainUrl || networking.pathAppUrl}
+                  </a>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyLinkValue(
+                        'headerUrl',
+                        (networking.customDomainUrl || networking.pathAppUrl)!
+                      )
+                    }
+                    className="inline-flex items-center gap-1 rounded border border-red-950/90 bg-[#12070a] px-2.5 py-1 text-[11px] font-medium text-slate-200 hover:border-red-500/45"
+                  >
+                    {copiedField === 'headerUrl' ? (
+                      <Check className="h-3 w-3 text-emerald-400" />
+                    ) : (
+                      <Copy className="h-3 w-3" />
+                    )}
+                    {copiedField === 'headerUrl' ? 'Copied' : 'Copy Link'}
+                  </button>
+                  <a
+                    href={networking.customDomainUrl || networking.pathAppUrl!}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-500"
+                  >
+                    Open App
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => setInlineDomainOpen((v) => !v)}
+                    className="inline-flex items-center gap-1 rounded border border-red-950/90 bg-[#12070a] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-red-500/45 hover:text-white"
+                  >
+                    <Globe className="h-3 w-3 text-red-400" />
+                    {networking.customDomain ? 'Change Domain' : 'Add Custom Domain'}
+                  </button>
+                </div>
+              </div>
+
+              {inlineDomainOpen && (
+                <div className="flex flex-col gap-2 border-t border-red-950/70 pt-2.5 sm:flex-row sm:items-center">
+                  <input
+                    type="text"
+                    value={domainInput}
+                    onChange={(e) => setDomainInput(e.target.value)}
+                    placeholder="api.yourdomain.com or mybot.up.railway.app"
+                    className="flex-1 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
+                  />
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={domainBusy}
+                      onClick={() => void handleDomainSave({ customDomain: domainInput })}
+                      className="rounded-md bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                    >
+                      {domainBusy ? 'Saving...' : 'Save Domain'}
+                    </button>
+                    {networking.customDomain && (
+                      <button
+                        type="button"
+                        disabled={verifyBusy}
+                        onClick={() => void handleVerifyDns()}
+                        className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
+                      >
+                        {verifyBusy ? 'Checking...' : 'Verify DNS'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('networking')}
+                      className="rounded-md border border-red-950/90 bg-[#12070a] px-2.5 py-1.5 text-[11px] text-slate-300 hover:text-white"
+                    >
+                      Full DNS Setup
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
       </section>
 
       {feedback && (

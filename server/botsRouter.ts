@@ -27,6 +27,8 @@ import {
 } from './gitRunner.ts';
 import {
   buildEmptyTelemetryHistory,
+  generateMonitorToken,
+  generateUniqueAppSlug,
   makeId,
   nowIso,
   pushDeploymentLog,
@@ -170,7 +172,7 @@ export function createBotsRouter(
       const ts = nowIso();
       const numericId = state.nextNumericId++;
       const dep: BotDeployment = {
-        id: makeId('bot'),
+        id: makeId('lyr'),
         numericId,
         pid: null,
         gitToken: body.gitToken ?? null,
@@ -195,6 +197,11 @@ export function createBotsRouter(
         totalChecks: 0,
         uptimePercentage: 0,
         healthScore: 0,
+        appSlug: generateUniqueAppSlug(body.name.trim(), state.deployments),
+        monitorToken: generateMonitorToken(),
+        publicAppEnabled: true,
+        customDomain: null,
+        customDomainVerified: false,
         telemetryHistory: buildEmptyTelemetryHistory(),
         settings: {
           name: body.name.trim(),
