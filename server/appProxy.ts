@@ -173,6 +173,173 @@ function sendProxyUnavailable(
 </html>`);
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatUptimeShort(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${rem}s`;
+  if (m > 0) return `${m}m ${rem}s`;
+  return `${rem}s`;
+}
+
+const COMMON_BOT_ROUTES = [
+  '/health',
+  '/status',
+  '/ping',
+  '/pair',
+  '/qr',
+  '/api',
+  '/api/health',
+  '/docs',
+  '/dashboard',
+];
+
+async function probeLiveBotRoutes(
+  targetPort: number
+): Promise<Array<{ path: string; status: number }>> {
+  const results = await Promise.all(
+    COMMON_BOT_ROUTES.map(async (route) => {
+      try {
+        const resp = await fetch(`http://127.0.0.1:${targetPort}${route}`, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(400),
+        });
+        if (resp.status !== 404 && resp.status < 500) {
+          return { path: route, status: resp.status };
+        }
+      } catch {
+        // ignore probe error/timeout
+      }
+      return null;
+    })
+  );
+  return results.filter((r): r is { path: string; status: number } => r !== null);
+}
+
+function sendRootBotGatewayPage(
+  res: Response,
+  dep: BotDeployment,
+  targetPort: number,
+  stripPrefix: string | undefined,
+  discoveredRoutes: Array<{ path: string; status: number }>
+): void {
+  if (res.headersSent) return;
+  const safeName = escapeHtml(dep.name);
+  const safeId = escapeHtml(dep.id);
+  const safeRuntime = escapeHtml(dep.settings.runtime);
+  const basePrefix = stripPrefix || '';
+  const uptimeText = formatUptimeShort(dep.uptimeSeconds || 0);
+  const cpuText = `${(dep.cpuPercent ?? 0).toFixed(1)}%`;
+  const ramText = `${Math.round(dep.memoryMb ?? 0)} / ${dep.memoryLimitMb} MB`;
+
+  const routeLinksHtml =
+    discoveredRoutes.length > 0
+      ? discoveredRoutes
+          .map((r) => {
+            const href = escapeHtml(`${basePrefix}${r.path}`);
+            return `<a class="route-pill" href="${href}"><span>${escapeHtml(r.path)}</span><span class="badge">HTTP ${r.status}</span></a>`;
+          })
+          .join('')
+      : `<p class="muted">No common HTTP sub-routes (<code>/health</code>, <code>/pair</code>, <code>/qr</code>, <code>/status</code>) responded yet — this bot appears to run purely as a background service with an internal keepalive listener.</p>`;
+
+  const quickSuggs = ['/health', '/status', '/pair', '/qr', '/api']
+    .map((p) => `<a class="quick-link" href="${escapeHtml(`${basePrefix}${p}`)}">${escapeHtml(p)}</a>`)
+    .join('');
+
+  res
+    .status(200)
+    .setHeader('Content-Type', 'text/html; charset=utf-8')
+    .setHeader('Cache-Control', 'no-store')
+    .send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${safeName} · Running on Lyrihost</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#080305;color:#e2e8f0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px;}
+    .card{max-width:560px;width:100%;border:1px solid rgba(52,211,153,0.3);background:#10080b;border-radius:14px;padding:24px;box-shadow:0 20px 50px rgba(0,0,0,0.55);}
+    .top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+    .status{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#34d399;background:rgba(16,185,129,0.12);border:1px solid rgba(52,211,153,0.3);padding:4px 10px;border-radius:6px;}
+    .dot{width:8px;height:8px;border-radius:50%;background:#34d399;box-shadow:0 0 8px #34d399;}
+    .id{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;color:#fda4af;background:#190c11;border:1px solid rgba(255,255,255,0.08);padding:4px 8px;border-radius:6px;}
+    h1{margin:0 0 8px;font-size:22px;color:#fff;}
+    p{margin:0 0 14px;font-size:14px;line-height:1.55;color:#cbd5e1;}
+    .muted{color:#94a3b8;font-size:13px;}
+    code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;color:#fda4af;background:#080305;padding:2px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.08);}
+    .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0;}
+    @media (max-width:520px){.metrics{grid-template-columns:repeat(2,1fr);}}
+    .metric{background:#0b0507;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px;}
+    .metric .label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin-bottom:4px;}
+    .metric .val{font-family:ui-monospace,SFMono-Regular,monospace;font-size:13px;font-weight:700;color:#fff;}
+    .section-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin:18px 0 8px;font-weight:700;}
+    .routes{display:flex;flex-wrap:wrap;gap:8px;}
+    .route-pill{display:inline-flex;align-items:center;gap:8px;text-decoration:none;color:#f8fafc;background:#170c11;border:1px solid rgba(52,211,153,0.35);padding:7px 11px;border-radius:8px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;}
+    .route-pill:hover{border-color:#34d399;background:#1b1116;}
+    .badge{font-size:10px;color:#34d399;background:rgba(16,185,129,0.12);padding:2px 6px;border-radius:4px;}
+    .form{display:flex;gap:8px;margin-top:10px;}
+    .input{flex:1;background:#080305;border:1px solid rgba(255,255,255,0.14);color:#fff;padding:9px 11px;border-radius:8px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:13px;}
+    .btn{background:#dc2626;color:#fff;border:0;padding:9px 14px;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer;}
+    .btn:hover{background:#ef4444;}
+    .quick-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;}
+    .quick-link{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;color:#cbd5e1;text-decoration:none;border:1px solid rgba(255,255,255,0.1);padding:4px 8px;border-radius:6px;background:#0b0507;}
+    .quick-link:hover{border-color:rgba(255,255,255,0.28);color:#fff;}
+    .footer{margin-top:18px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;font-size:12px;color:#94a3b8;}
+    .footer a{color:#f87171;text-decoration:none;font-weight:600;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <span class="status"><span class="dot"></span>Online &amp; Running</span>
+      <span class="id">${safeId}</span>
+    </div>
+    <h1>${safeName}</h1>
+    <p>
+      Your <code>${safeRuntime}</code> service is running on internal port <code>${targetPort}</code>.
+      The app responded with <code>Cannot GET /</code> because this repository does not define a root <code>GET /</code> webpage
+      (normal for WhatsApp, Telegram, Discord bots, and API-only servers).
+    </p>
+    <div class="metrics">
+      <div class="metric"><div class="label">CPU</div><div class="val">${escapeHtml(cpuText)}</div></div>
+      <div class="metric"><div class="label">RAM</div><div class="val">${escapeHtml(ramText)}</div></div>
+      <div class="metric"><div class="label">Uptime</div><div class="val">${escapeHtml(uptimeText)}</div></div>
+      <div class="metric"><div class="label">Port</div><div class="val">${targetPort}</div></div>
+    </div>
+
+    <div class="section-title">Detected Active Endpoints</div>
+    <div class="routes">${routeLinksHtml}</div>
+
+    <div class="section-title">Open a Specific App Route</div>
+    <form class="form" onsubmit="event.preventDefault();var p=document.getElementById('rp').value.trim();if(!p)return;if(!p.startsWith('/'))p='/'+p;window.location.href=${JSON.stringify(basePrefix)}+p;">
+      <input id="rp" class="input" type="text" placeholder="/pair, /qr, /health, /api" value="/health" />
+      <button class="btn" type="submit">Open Route</button>
+    </form>
+    <div class="quick-row">${quickSuggs}</div>
+
+    <div class="footer">
+      <span>Add <code>app.get('/', ...)</code> in your repo to serve a custom homepage.</span>
+      <a href="/">← Lyrihost Dashboard</a>
+    </div>
+  </div>
+</body>
+</html>`);
+}
+
 export function proxyHttpRequest(
   req: Request,
   res: Response,
@@ -233,6 +400,11 @@ export function proxyHttpRequest(
     outgoingHeaders['content-length'] = req.headers['content-length'];
   }
 
+  const shouldCheckBareRoot404 =
+    req.method === 'GET' &&
+    upstreamPath === '/' &&
+    (req.headers.accept || '').includes('text/html');
+
   const proxyReq = http.request(
     {
       hostname: '127.0.0.1',
@@ -249,6 +421,51 @@ export function proxyHttpRequest(
           respHeaders.location = `${stripPrefix}${respHeaders.location}`;
         }
       }
+
+      if (shouldCheckBareRoot404 && proxyRes.statusCode === 404 && !proxyRes.headers['content-encoding']) {
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        let bypassed = false;
+
+        proxyRes.on('data', (chunk: Buffer) => {
+          if (bypassed) return;
+          totalBytes += chunk.length;
+          if (totalBytes > 4096) {
+            bypassed = true;
+            res.writeHead(404, respHeaders);
+            for (const c of chunks) res.write(c);
+            res.write(chunk);
+            proxyRes.pipe(res);
+            return;
+          }
+          chunks.push(chunk);
+        });
+
+        proxyRes.on('end', () => {
+          if (bypassed || res.headersSent) return;
+          const bodyBuf = Buffer.concat(chunks);
+          const bodyText = bodyBuf.toString('utf-8');
+          const isBareRoot404 =
+            /cannot\s+get\s+\//i.test(bodyText) ||
+            /^\s*(?:not found|404(?:\s+not found)?)\s*$/i.test(bodyText);
+
+          if (!isBareRoot404) {
+            res.writeHead(404, respHeaders);
+            res.end(bodyBuf);
+            return;
+          }
+
+          void probeLiveBotRoutes(targetPort)
+            .then((routes) => {
+              sendRootBotGatewayPage(res, dep, targetPort, stripPrefix, routes);
+            })
+            .catch(() => {
+              sendRootBotGatewayPage(res, dep, targetPort, stripPrefix, []);
+            });
+        });
+        return;
+      }
+
       res.writeHead(proxyRes.statusCode || 502, respHeaders);
       proxyRes.pipe(res);
     }
