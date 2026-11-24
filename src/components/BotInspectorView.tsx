@@ -85,8 +85,10 @@ export function BotInspectorView({
 
   const [networking, setNetworking] = useState<DeploymentNetworkingInfo | null>(null);
   const [domainInput, setDomainInput] = useState(deployment.customDomain || '');
+  const [slugInput, setSlugInput] = useState(deployment.appSlug || '');
   const [domainBusy, setDomainBusy] = useState(false);
   const [inlineDomainOpen, setInlineDomainOpen] = useState(false);
+  const [inlineLinkOpen, setInlineLinkOpen] = useState(false);
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [dnsCheckResult, setDnsCheckResult] = useState<{ verified: boolean; message: string } | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -98,6 +100,7 @@ export function BotInspectorView({
   useEffect(() => {
     setDraftSettings(deployment.settings);
     setDomainInput(deployment.customDomain || '');
+    setSlugInput(deployment.appSlug || '');
     setDnsCheckResult(null);
     setUptimeProbeResult(null);
     setConfirmDelete(false);
@@ -120,6 +123,9 @@ export function BotInspectorView({
         const data = (await resp.json()) as DeploymentNetworkingInfo;
         if (active) {
           setNetworking(data);
+          if (data.appSlug) {
+            setSlugInput((prev) => prev || data.appSlug);
+          }
         }
       } catch {
         // ignore transient fetch failure
@@ -266,7 +272,11 @@ export function BotInspectorView({
     }
   };
 
-  const handleDomainSave = async (opts: { customDomain?: string | null; publicAppEnabled?: boolean }) => {
+  const handleDomainSave = async (opts: {
+    customDomain?: string | null;
+    publicAppEnabled?: boolean;
+    appSlug?: string | null;
+  }) => {
     setDomainBusy(true);
     setFeedback(null);
     setDnsCheckResult(null);
@@ -280,20 +290,25 @@ export function BotInspectorView({
         body: JSON.stringify(opts),
       });
       const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Failed to update domain settings.');
+      if (!resp.ok) throw new Error(data.error || 'Failed to update link settings.');
       if (data.deployment) onUpdated(data.deployment as BotDeployment);
       if (data.networking) setNetworking(data.networking as DeploymentNetworkingInfo);
       if (opts.customDomain !== undefined) {
         setDomainInput((data.networking?.customDomain as string) || '');
+      }
+      if (opts.appSlug !== undefined && data.networking?.appSlug) {
+        setSlugInput(String(data.networking.appSlug));
       }
       setFeedback({
         type: 'success',
         text:
           opts.publicAppEnabled !== undefined
             ? `Public app & UptimeRobot links ${opts.publicAppEnabled ? 'enabled' : 'disabled'}.`
-            : opts.customDomain
-              ? 'Custom domain saved. Point your DNS CNAME record and click Verify DNS.'
-              : 'Custom domain removed.',
+            : opts.appSlug !== undefined
+              ? `Live app link updated to ${data.networking?.pathAppUrl || `/app/${data.networking?.appSlug}/`}.`
+              : opts.customDomain
+                ? 'Custom domain saved. Point your DNS CNAME record and click Verify DNS.'
+                : 'Custom domain removed.',
       });
     } catch (err) {
       setFeedback({
@@ -590,7 +605,21 @@ export function BotInspectorView({
                   </a>
                   <button
                     type="button"
-                    onClick={() => setInlineDomainOpen((v) => !v)}
+                    onClick={() => {
+                      setInlineLinkOpen((v) => !v);
+                      setInlineDomainOpen(false);
+                    }}
+                    className="inline-flex items-center gap-1 rounded border border-red-950/90 bg-[#12070a] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-red-500/45 hover:text-white"
+                  >
+                    <Link2 className="h-3 w-3 text-emerald-400" />
+                    Edit Link
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInlineDomainOpen((v) => !v);
+                      setInlineLinkOpen(false);
+                    }}
                     className="inline-flex items-center gap-1 rounded border border-red-950/90 bg-[#12070a] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-red-500/45 hover:text-white"
                   >
                     <Globe className="h-3 w-3 text-red-400" />
@@ -598,6 +627,34 @@ export function BotInspectorView({
                   </button>
                 </div>
               </div>
+
+              {inlineLinkOpen && (
+                <div className="flex flex-col gap-2 border-t border-red-950/70 pt-2.5 sm:flex-row sm:items-center">
+                  <div className="flex flex-1 items-center rounded-md border border-red-950/90 bg-[#12070a] px-3 py-1.5 font-mono text-xs">
+                    <span className="text-slate-500 shrink-0 select-none">
+                      {networking.railwayDomain ? `https://${networking.railwayDomain}/app/` : '/app/'}
+                    </span>
+                    <input
+                      type="text"
+                      value={slugInput}
+                      onChange={(e) => setSlugInput(e.target.value)}
+                      placeholder="my-web-app"
+                      className="min-w-0 flex-1 bg-transparent text-emerald-300 placeholder:text-slate-600 focus:outline-none"
+                    />
+                    <span className="text-slate-500 shrink-0 select-none">/</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={domainBusy}
+                      onClick={() => void handleDomainSave({ appSlug: slugInput })}
+                      className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                    >
+                      {domainBusy ? 'Saving...' : 'Save Link'}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {inlineDomainOpen && (
                 <div className="flex flex-col gap-2 border-t border-red-950/70 pt-2.5 sm:flex-row sm:items-center">
@@ -1027,17 +1084,32 @@ export function BotInspectorView({
                   </div>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Forwards HTTP &amp; WebSocket traffic through your Railway server domain directly to this Node process.
+                  Edit the app link slug below to customize your live Railway URL, forwarding HTTP &amp; WebSocket traffic directly to your Node app.
                 </p>
                 {networking?.pathAppUrl && (
                   <div className="flex flex-col gap-2 sm:flex-row">
-                    <input
-                      type="text"
-                      readOnly
-                      value={networking.pathAppUrl}
-                      className="flex-1 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 font-mono text-xs text-rose-200"
-                    />
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex flex-1 items-center rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 font-mono text-xs">
+                      <span className="text-slate-500 shrink-0 select-none">
+                        {networking.railwayDomain ? `https://${networking.railwayDomain}/app/` : '/app/'}
+                      </span>
+                      <input
+                        type="text"
+                        value={slugInput}
+                        onChange={(e) => setSlugInput(e.target.value)}
+                        placeholder="my-web-app"
+                        className="min-w-0 flex-1 bg-transparent text-rose-200 placeholder:text-slate-600 focus:outline-none"
+                      />
+                      <span className="text-slate-500 shrink-0 select-none">/</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        disabled={domainBusy}
+                        onClick={() => void handleDomainSave({ appSlug: slugInput })}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                      >
+                        {domainBusy ? 'Saving...' : 'Save Link'}
+                      </button>
                       <button
                         type="button"
                         onClick={() => void copyLinkValue('appUrl', networking.pathAppUrl!)}

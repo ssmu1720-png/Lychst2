@@ -57,6 +57,37 @@ export function normalizeHostname(raw: string): string | null {
   return cleaned;
 }
 
+export function normalizeAppSlug(raw: string): string | null {
+  let candidate = raw.trim().toLowerCase();
+  if (!candidate) return null;
+
+  if (/^https?:\/\//i.test(candidate)) {
+    try {
+      candidate = new URL(candidate).pathname;
+    } catch {
+      return null;
+    }
+  }
+
+  const appPrefixMatch = candidate.match(/\/app\/([^/?#]+)/i);
+  if (appPrefixMatch) {
+    candidate = appPrefixMatch[1];
+  } else {
+    candidate = candidate.replace(/^\/+|\/+$/g, '').split('/')[0] || '';
+  }
+
+  const cleaned = candidate
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+
+  if (cleaned.length < 2 || !/^[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?$/.test(cleaned)) {
+    return null;
+  }
+  return cleaned;
+}
+
 export function extractRequestHost(rawHostHeader?: string | string[]): string {
   const first = Array.isArray(rawHostHeader) ? rawHostHeader[0] : rawHostHeader || '';
   return first.split(',')[0].trim().toLowerCase().replace(/:\d+$/, '').replace(/\.+$/, '');
@@ -83,11 +114,15 @@ export interface ProxyResolution {
   stripPrefix?: string;
 }
 
+const LYRIHOST_RESERVED_PREFIX_RE =
+  /^\/(?:app\/|up\/|api\/(?:auth|wallet|support|admin|bots|deployments|preferences|health|healthz|system)\b|ws\/bots\/)/i;
+
 export function resolveDeploymentByProxyRequest(
   reqUrl: string,
   hostHeader: string | string[] | undefined,
   deployments: BotDeployment[],
-  platformWildcardDomain?: string
+  platformWildcardDomain?: string,
+  refererHeader?: string | string[]
 ): ProxyResolution | null {
   const reqHost = extractRequestHost(hostHeader);
   const wildcardBase = platformWildcardDomain ? normalizeHostname(platformWildcardDomain) : null;
@@ -122,6 +157,34 @@ export function resolveDeploymentByProxyRequest(
         mode: 'path-prefix',
         stripPrefix: `/app/${match[1]}`,
       };
+    }
+  }
+
+  // 3. Referer-based fallback for root-relative web app assets (/assets/*, /_next/*, /static/*, etc.) loaded from /app/<slug>/
+  if (refererHeader && !LYRIHOST_RESERVED_PREFIX_RE.test(pathname)) {
+    const rawReferer = Array.isArray(refererHeader) ? refererHeader[0] : refererHeader;
+    if (rawReferer) {
+      try {
+        const refPath = new URL(rawReferer).pathname;
+        const refMatch = refPath.match(/^\/app\/([a-z0-9][a-z0-9-]{1,60})(?:\/|$)/i);
+        if (refMatch) {
+          const slug = refMatch[1].toLowerCase();
+          const dep = deployments.find(
+            (d) =>
+              supportsPublicEndpoints(d) &&
+              d.publicAppEnabled !== false &&
+              d.appSlug?.toLowerCase() === slug
+          );
+          if (dep) {
+            return {
+              dep,
+              mode: 'path-prefix',
+            };
+          }
+        }
+      } catch {
+        // ignore invalid referer URL
+      }
     }
   }
 
@@ -340,6 +403,31 @@ function sendRootBotGatewayPage(
 </html>`);
 }
 
+const preferredLoopbackHost = new Map<number, '127.0.0.1' | '::1'>();
+
+function rewriteHtmlForSubpathProxy(html: string, stripPrefix: string): string {
+  const escapedPrefix = stripPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rootAttrRe = new RegExp(
+    `(\\b(?:href|src|action|poster|data-src)\\s*=\\s*["'])(/(?!/)(?!${escapedPrefix}(?:/|$)))`,
+    'gi'
+  );
+  let rewritten = html.replace(rootAttrRe, `$1${stripPrefix}$2`);
+
+  const hasBaseTag = /<base\b/i.test(rewritten);
+  const baseTag = hasBaseTag ? '' : `<base href="${escapeHtml(stripPrefix)}/">`;
+  const runtimeShim = `<script data-lyrihost-proxy>(function(){var P=${JSON.stringify(stripPrefix)};function r(u){if(typeof u!=='string')return u;if(u.charAt(0)==='/'&&u.charAt(1)!=='/'&&u.indexOf(P+'/')!==0&&u!==P)return P+u;return u;}var f=window.fetch;if(f){window.fetch=function(i,o){if(typeof i==='string')i=r(i);else if(i&&typeof Request!=='undefined'&&i instanceof Request){try{var u=new URL(i.url,location.href);if(u.origin===location.origin&&u.pathname.indexOf(P+'/')!==0&&u.pathname!==P){i=new Request(r(u.pathname+u.search+u.hash),i);}}catch(e){}}return f.call(this,i,o);};}if(window.XMLHttpRequest){var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var a=Array.prototype.slice.call(arguments);if(typeof u==='string')a[1]=r(u);return xo.apply(this,a);};}if(window.EventSource){var ES=window.EventSource;window.EventSource=function(u,c){return new ES(r(u),c);};window.EventSource.prototype=ES.prototype;}if(window.WebSocket){var WS=window.WebSocket;window.WebSocket=function(u,p){if(typeof u==='string'){try{var pu=new URL(u,location.href);if(pu.host===location.host&&pu.pathname.indexOf(P+'/')!==0){pu.pathname=r(pu.pathname);u=pu.toString();}}catch(e){}}return p!==undefined?new WS(u,p):new WS(u);};window.WebSocket.prototype=WS.prototype;}})();</script>`;
+  const injection = `${baseTag}${runtimeShim}`;
+
+  if (/<head\b[^>]*>/i.test(rewritten)) {
+    rewritten = rewritten.replace(/<head\b[^>]*>/i, (m) => `${m}${injection}`);
+  } else if (/<html\b[^>]*>/i.test(rewritten)) {
+    rewritten = rewritten.replace(/<html\b[^>]*>/i, (m) => `${m}<head>${injection}</head>`);
+  } else {
+    rewritten = `${injection}${rewritten}`;
+  }
+  return rewritten;
+}
+
 export function proxyHttpRequest(
   req: Request,
   res: Response,
@@ -383,6 +471,10 @@ export function proxyHttpRequest(
   const targetPort = resolveDeploymentInternalPort(dep);
   const outgoingHeaders: http.OutgoingHttpHeaders = { ...req.headers };
   delete outgoingHeaders['content-length'];
+  if (stripPrefix) {
+    // Request uncompressed HTML over loopback so subpath HTML rewriting is fast and lossless
+    outgoingHeaders['accept-encoding'] = 'identity';
+  }
   outgoingHeaders.host = `127.0.0.1:${targetPort}`;
   outgoingHeaders['x-forwarded-host'] =
     (req.headers['x-forwarded-host'] || req.headers.host || '').toString();
@@ -405,87 +497,145 @@ export function proxyHttpRequest(
     upstreamPath === '/' &&
     (req.headers.accept || '').includes('text/html');
 
-  const proxyReq = http.request(
-    {
-      hostname: '127.0.0.1',
-      port: targetPort,
-      path: fullTargetPath,
-      method: req.method,
-      headers: outgoingHeaders,
-      timeout: 30000,
-    },
-    (proxyRes) => {
-      const respHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
-      if (stripPrefix && typeof respHeaders.location === 'string' && respHeaders.location.startsWith('/')) {
-        if (!respHeaders.location.startsWith(stripPrefix)) {
-          respHeaders.location = `${stripPrefix}${respHeaders.location}`;
+  const initialHost = preferredLoopbackHost.get(targetPort) || '127.0.0.1';
+  const canRetryBodyless = req.method === 'GET' || req.method === 'HEAD';
+
+  const attemptProxy = (targetHost: '127.0.0.1' | '::1', hasRetried: boolean): void => {
+    const reqHeaders = { ...outgoingHeaders };
+    reqHeaders.host =
+      targetHost === '::1' ? `[::1]:${targetPort}` : `127.0.0.1:${targetPort}`;
+
+    const proxyReq = http.request(
+      {
+        hostname: targetHost,
+        port: targetPort,
+        path: fullTargetPath,
+        method: req.method,
+        headers: reqHeaders,
+        timeout: 30000,
+      },
+      (proxyRes) => {
+        preferredLoopbackHost.set(targetPort, targetHost);
+        const respHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
+        if (stripPrefix && typeof respHeaders.location === 'string' && respHeaders.location.startsWith('/')) {
+          if (!respHeaders.location.startsWith(stripPrefix)) {
+            respHeaders.location = `${stripPrefix}${respHeaders.location}`;
+          }
         }
+
+        if (shouldCheckBareRoot404 && proxyRes.statusCode === 404 && !proxyRes.headers['content-encoding']) {
+          const chunks: Buffer[] = [];
+          let totalBytes = 0;
+          let bypassed = false;
+
+          proxyRes.on('data', (chunk: Buffer) => {
+            if (bypassed) return;
+            totalBytes += chunk.length;
+            if (totalBytes > 4096) {
+              bypassed = true;
+              res.writeHead(404, respHeaders);
+              for (const c of chunks) res.write(c);
+              res.write(chunk);
+              proxyRes.pipe(res);
+              return;
+            }
+            chunks.push(chunk);
+          });
+
+          proxyRes.on('end', () => {
+            if (bypassed || res.headersSent) return;
+            const bodyBuf = Buffer.concat(chunks);
+            const bodyText = bodyBuf.toString('utf-8');
+            const isBareRoot404 =
+              /cannot\s+get\s+\//i.test(bodyText) ||
+              /^\s*(?:not found|404(?:\s+not found)?)\s*$/i.test(bodyText);
+
+            if (!isBareRoot404) {
+              res.writeHead(404, respHeaders);
+              res.end(bodyBuf);
+              return;
+            }
+
+            void probeLiveBotRoutes(targetPort)
+              .then((routes) => {
+                sendRootBotGatewayPage(res, dep, targetPort, stripPrefix, routes);
+              })
+              .catch(() => {
+                sendRootBotGatewayPage(res, dep, targetPort, stripPrefix, []);
+              });
+          });
+          return;
+        }
+
+        const contentType = String(proxyRes.headers['content-type'] || '').toLowerCase();
+        if (
+          stripPrefix &&
+          req.method === 'GET' &&
+          contentType.includes('text/html') &&
+          !proxyRes.headers['content-encoding']
+        ) {
+          const htmlChunks: Buffer[] = [];
+          let htmlBytes = 0;
+          let streamed = false;
+
+          proxyRes.on('data', (chunk: Buffer) => {
+            if (streamed) return;
+            htmlBytes += chunk.length;
+            if (htmlBytes > 1024 * 1024) {
+              streamed = true;
+              res.writeHead(proxyRes.statusCode || 200, respHeaders);
+              for (const c of htmlChunks) res.write(c);
+              res.write(chunk);
+              proxyRes.pipe(res);
+              return;
+            }
+            htmlChunks.push(chunk);
+          });
+
+          proxyRes.on('end', () => {
+            if (streamed || res.headersSent) return;
+            const rawHtml = Buffer.concat(htmlChunks).toString('utf-8');
+            const modifiedHtml = rewriteHtmlForSubpathProxy(rawHtml, stripPrefix);
+            const finalHeaders = { ...respHeaders };
+            delete finalHeaders['content-length'];
+            res.writeHead(proxyRes.statusCode || 200, finalHeaders);
+            res.end(modifiedHtml, 'utf-8');
+          });
+          return;
+        }
+
+        res.writeHead(proxyRes.statusCode || 502, respHeaders);
+        proxyRes.pipe(res);
       }
+    );
 
-      if (shouldCheckBareRoot404 && proxyRes.statusCode === 404 && !proxyRes.headers['content-encoding']) {
-        const chunks: Buffer[] = [];
-        let totalBytes = 0;
-        let bypassed = false;
+    proxyReq.on('timeout', () => {
+      proxyReq.destroy(new Error('Upstream request timed out.'));
+    });
 
-        proxyRes.on('data', (chunk: Buffer) => {
-          if (bypassed) return;
-          totalBytes += chunk.length;
-          if (totalBytes > 4096) {
-            bypassed = true;
-            res.writeHead(404, respHeaders);
-            for (const c of chunks) res.write(c);
-            res.write(chunk);
-            proxyRes.pipe(res);
-            return;
-          }
-          chunks.push(chunk);
-        });
-
-        proxyRes.on('end', () => {
-          if (bypassed || res.headersSent) return;
-          const bodyBuf = Buffer.concat(chunks);
-          const bodyText = bodyBuf.toString('utf-8');
-          const isBareRoot404 =
-            /cannot\s+get\s+\//i.test(bodyText) ||
-            /^\s*(?:not found|404(?:\s+not found)?)\s*$/i.test(bodyText);
-
-          if (!isBareRoot404) {
-            res.writeHead(404, respHeaders);
-            res.end(bodyBuf);
-            return;
-          }
-
-          void probeLiveBotRoutes(targetPort)
-            .then((routes) => {
-              sendRootBotGatewayPage(res, dep, targetPort, stripPrefix, routes);
-            })
-            .catch(() => {
-              sendRootBotGatewayPage(res, dep, targetPort, stripPrefix, []);
-            });
-        });
+    proxyReq.on('error', (err: NodeJS.ErrnoException) => {
+      if (!hasRetried && canRetryBodyless && err.code === 'ECONNREFUSED') {
+        const altHost: '127.0.0.1' | '::1' = targetHost === '127.0.0.1' ? '::1' : '127.0.0.1';
+        attemptProxy(altHost, true);
         return;
       }
+      sendProxyUnavailable(
+        req,
+        res,
+        dep,
+        502,
+        `Process is running, but no HTTP web server is listening on assigned port ${targetPort}. (Background bots without an HTTP server can still be monitored via their UptimeRobot link.)`
+      );
+    });
 
-      res.writeHead(proxyRes.statusCode || 502, respHeaders);
-      proxyRes.pipe(res);
+    if (canRetryBodyless) {
+      proxyReq.end();
+    } else {
+      req.pipe(proxyReq);
     }
-  );
+  };
 
-  proxyReq.on('timeout', () => {
-    proxyReq.destroy(new Error('Upstream request timed out.'));
-  });
-
-  proxyReq.on('error', () => {
-    sendProxyUnavailable(
-      req,
-      res,
-      dep,
-      502,
-      `Process is running, but no HTTP web server is listening on assigned port ${targetPort}. (Background bots without an HTTP server can still be monitored via their UptimeRobot link.)`
-    );
-  });
-
-  req.pipe(proxyReq);
+  attemptProxy(initialHost, false);
 }
 
 export function proxyWebSocketUpgrade(
@@ -510,30 +660,42 @@ export function proxyWebSocketUpgrade(
   }
   const fullTargetPath = rawQuery ? `${targetPath}?${rawQuery}` : targetPath;
 
-  const upstream = net.connect(targetPort, '127.0.0.1', () => {
-    const headerLines = [`${request.method || 'GET'} ${fullTargetPath} HTTP/1.1`];
-    for (let i = 0; i < request.rawHeaders.length; i += 2) {
-      const k = request.rawHeaders[i];
-      const v = request.rawHeaders[i + 1] ?? '';
-      if (k.toLowerCase() === 'host') {
-        headerLines.push(`Host: 127.0.0.1:${targetPort}`);
-      } else {
-        headerLines.push(`${k}: ${v}`);
+  const initialHost = preferredLoopbackHost.get(targetPort) || '127.0.0.1';
+  const connectUpstream = (targetHost: '127.0.0.1' | '::1', hasRetried: boolean): void => {
+    let connected = false;
+    const upstream = net.connect(targetPort, targetHost, () => {
+      connected = true;
+      preferredLoopbackHost.set(targetPort, targetHost);
+      const headerLines = [`${request.method || 'GET'} ${fullTargetPath} HTTP/1.1`];
+      for (let i = 0; i < request.rawHeaders.length; i += 2) {
+        const k = request.rawHeaders[i];
+        const v = request.rawHeaders[i + 1] ?? '';
+        if (k.toLowerCase() === 'host') {
+          headerLines.push(`Host: ${targetHost === '::1' ? '[::1]' : '127.0.0.1'}:${targetPort}`);
+        } else {
+          headerLines.push(`${k}: ${v}`);
+        }
       }
-    }
-    headerLines.push('', '');
-    upstream.write(headerLines.join('\r\n'));
-    if (head.length > 0) upstream.write(head);
-    upstream.pipe(socket);
-    socket.pipe(upstream);
-  });
+      headerLines.push('', '');
+      upstream.write(headerLines.join('\r\n'));
+      if (head.length > 0) upstream.write(head);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
 
-  upstream.on('error', () => {
-    socket.destroy();
-  });
-  socket.on('error', () => {
-    upstream.destroy();
-  });
+    upstream.on('error', (err: NodeJS.ErrnoException) => {
+      if (!connected && !hasRetried && err.code === 'ECONNREFUSED') {
+        connectUpstream(targetHost === '127.0.0.1' ? '::1' : '127.0.0.1', true);
+        return;
+      }
+      socket.destroy();
+    });
+    socket.on('error', () => {
+      upstream.destroy();
+    });
+  };
+
+  connectUpstream(initialHost, false);
 }
 
 export async function verifyCustomDomainDns(

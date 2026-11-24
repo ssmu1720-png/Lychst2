@@ -64,6 +64,7 @@ import {
   buildDeploymentNetworkingInfo,
   extractRequestHost,
   isNodeHostedRuntime,
+  normalizeAppSlug,
   normalizeHostname,
   proxyHttpRequest,
   proxyWebSocketUpgrade,
@@ -1183,7 +1184,8 @@ async function startServer() {
       req.originalUrl || req.url || '/',
       req.headers['x-forwarded-host'] || req.headers.host,
       state.deployments,
-      getEffectiveWildcardDomain()
+      getEffectiveWildcardDomain(),
+      req.headers.referer
     );
     if (match) {
       proxyHttpRequest(req, res, match);
@@ -1538,6 +1540,7 @@ async function startServer() {
       gitToken,
       planId: requestedPlanId,
       customDomain: requestedCustomDomain,
+      appSlug: requestedAppSlug,
       settings,
       scanReport,
     } = req.body as {
@@ -1549,6 +1552,7 @@ async function startServer() {
       gitToken?: string;
       planId?: DeploymentPlanId;
       customDomain?: string | null;
+      appSlug?: string | null;
       settings?: BotSettings;
       scanReport?: GitHubScanResult | null;
     };
@@ -1610,6 +1614,33 @@ async function startServer() {
         return;
       }
       initialCustomDomain = normalized;
+    }
+
+    let initialAppSlug: string | undefined;
+    if (typeof requestedAppSlug === 'string' && requestedAppSlug.trim()) {
+      if (!isNode) {
+        res.status(400).json({
+          error: 'Custom app URLs are supported for Node.js apps and Node bots only.',
+        });
+        return;
+      }
+      const normalizedSlug = normalizeAppSlug(requestedAppSlug);
+      if (!normalizedSlug) {
+        res.status(400).json({
+          error: 'Enter a valid app URL slug (2–60 lowercase letters, numbers, or hyphens).',
+        });
+        return;
+      }
+      const slugConflict = state.deployments.find(
+        (other) => other.appSlug?.toLowerCase() === normalizedSlug
+      );
+      if (slugConflict) {
+        res.status(409).json({
+          error: `App link "/app/${normalizedSlug}/" is already in use by another deployment.`,
+        });
+        return;
+      }
+      initialAppSlug = normalizedSlug;
     }
 
     const resolvedPlanId: DeploymentPlanId =
@@ -1683,7 +1714,7 @@ async function startServer() {
       healthScore: 0,
       ...(isNode
         ? {
-            appSlug: generateUniqueAppSlug(settings.name.trim(), state.deployments, botId),
+            appSlug: initialAppSlug || generateUniqueAppSlug(settings.name.trim(), state.deployments, botId),
             monitorToken: generateMonitorToken(),
             publicAppEnabled: true,
             customDomain: initialCustomDomain,
@@ -1745,13 +1776,39 @@ async function startServer() {
       return;
     }
 
-    const { customDomain, publicAppEnabled } = (req.body ?? {}) as {
+    const { customDomain, publicAppEnabled, appSlug } = (req.body ?? {}) as {
       customDomain?: string | null;
       publicAppEnabled?: boolean;
+      appSlug?: string | null;
     };
 
     if (typeof publicAppEnabled === 'boolean') {
       dep.publicAppEnabled = publicAppEnabled;
+    }
+
+    if (appSlug !== undefined) {
+      const rawSlug = (appSlug || '').trim();
+      if (!rawSlug) {
+        dep.appSlug = generateUniqueAppSlug(dep.name, state.deployments, dep.id);
+      } else {
+        const normalizedSlug = normalizeAppSlug(rawSlug);
+        if (!normalizedSlug) {
+          res.status(400).json({
+            error: 'Enter a valid app link slug (2–60 lowercase letters, numbers, or hyphens, e.g. my-web-app).',
+          });
+          return;
+        }
+        const slugConflict = state.deployments.find(
+          (other) => other.id !== dep.id && other.appSlug?.toLowerCase() === normalizedSlug
+        );
+        if (slugConflict) {
+          res.status(409).json({
+            error: `App link "/app/${normalizedSlug}/" is already used by another deployment.`,
+          });
+          return;
+        }
+        dep.appSlug = normalizedSlug;
+      }
     }
 
     if (customDomain !== undefined) {
@@ -2304,7 +2361,8 @@ async function startServer() {
       url,
       request.headers['x-forwarded-host'] || request.headers.host,
       state.deployments,
-      getEffectiveWildcardDomain()
+      getEffectiveWildcardDomain(),
+      request.headers.referer
     );
     if (proxyMatch) {
       proxyWebSocketUpgrade(request, socket, head, proxyMatch);

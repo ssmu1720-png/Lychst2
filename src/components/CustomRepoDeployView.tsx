@@ -112,6 +112,7 @@ export function CustomRepoDeployView({
   });
 
   const [customDomain, setCustomDomain] = useState('');
+  const [appSlug, setAppSlug] = useState('');
   const [deploying, setDeploying] = useState(false);
   const [deployError, setDeployError] = useState<string | null>(null);
 
@@ -179,6 +180,7 @@ export function CustomRepoDeployView({
           commitSha: 'head',
           planId: selectedPlan.id,
           ...(isNodeRuntime && customDomain.trim() ? { customDomain: customDomain.trim() } : {}),
+          ...(isNodeRuntime && appSlug.trim() ? { appSlug: appSlug.trim() } : {}),
           settings: {
             ...settings,
             name: cleanName,
@@ -476,25 +478,42 @@ export function CustomRepoDeployView({
           </div>
         </div>
 
-        {/* Optional Custom Domain (Node.js / Bun only) */}
+        {/* Optional Editable App URL & Custom Domain (Node.js / Bun only) */}
         {isNodeRuntime && (
-          <div className="border-t border-red-950/70 pt-5 space-y-2">
-            <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="grid grid-cols-1 gap-4 border-t border-red-950/70 pt-5 md:grid-cols-2">
+            <div className="space-y-2">
+              <label className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                <Globe className="h-3.5 w-3.5 text-emerald-400" />
+                Editable App Link Slug (Optional)
+              </label>
+              <div className="flex items-center rounded-md border border-red-950/90 bg-[#080305] px-3 py-2 font-mono text-xs">
+                <span className="text-slate-500 shrink-0 select-none">
+                  {preferences.railwayDomain ? `https://${preferences.railwayDomain}/app/` : '/app/'}
+                </span>
+                <input
+                  type="text"
+                  value={appSlug}
+                  onChange={(e) => setAppSlug(e.target.value)}
+                  placeholder="auto-generated"
+                  className="min-w-0 flex-1 bg-transparent text-emerald-300 placeholder:text-slate-600 focus:outline-none"
+                />
+                <span className="text-slate-500 shrink-0 select-none">/</span>
+              </div>
+            </div>
+
+            <div className="space-y-2">
               <label className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
                 <Globe className="h-3.5 w-3.5 text-red-400" />
                 Custom Domain (Optional · Node Apps &amp; Bots)
               </label>
-              <span className="font-mono text-[11px] text-slate-400">
-                You can also add or change this anytime under Domains
-              </span>
+              <input
+                type="text"
+                value={customDomain}
+                onChange={(e) => setCustomDomain(e.target.value)}
+                placeholder="api.yourdomain.com"
+                className="w-full rounded-md border border-red-950/90 bg-[#080305] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
+              />
             </div>
-            <input
-              type="text"
-              value={customDomain}
-              onChange={(e) => setCustomDomain(e.target.value)}
-              placeholder="api.yourdomain.com (leave empty to use server Railway /app/<slug>/ URL)"
-              className="w-full rounded-md border border-red-950/90 bg-[#080305] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
-            />
           </div>
         )}
 

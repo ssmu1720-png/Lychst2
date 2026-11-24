@@ -56,7 +56,8 @@ export function DomainsView({
 
   const [networkingMap, setNetworkingMap] = useState<Record<string, DeploymentNetworkingInfo>>({});
   const [domainInputs, setDomainInputs] = useState<Record<string, string>>({});
-  const [busyMap, setBusyMap] = useState<Record<string, 'save' | 'verify' | 'toggle' | 'test' | undefined>>({});
+  const [slugInputs, setSlugInputs] = useState<Record<string, string>>({});
+  const [busyMap, setBusyMap] = useState<Record<string, 'save' | 'slug' | 'verify' | 'toggle' | 'test' | undefined>>({});
   const [feedbackMap, setFeedbackMap] = useState<
     Record<string, { type: 'success' | 'error'; text: string } | undefined>
   >({});
@@ -95,6 +96,15 @@ export function DomainsView({
       }
       return next;
     });
+    setSlugInputs((prev) => {
+      const next = { ...prev };
+      for (const dep of nodeDeployments) {
+        if (next[dep.id] === undefined) {
+          next[dep.id] = nextMap[dep.id]?.appSlug ?? dep.appSlug ?? '';
+        }
+      }
+      return next;
+    });
   }, [authToken, nodeDeployments]);
 
   useEffect(() => {
@@ -124,8 +134,8 @@ export function DomainsView({
 
   const handleSaveDomain = async (
     dep: BotDeployment,
-    payload: { customDomain?: string | null; publicAppEnabled?: boolean },
-    actionType: 'save' | 'toggle'
+    payload: { customDomain?: string | null; publicAppEnabled?: boolean; appSlug?: string | null },
+    actionType: 'save' | 'slug' | 'toggle'
   ) => {
     setBusyMap((prev) => ({ ...prev, [dep.id]: actionType }));
     setFeedbackMap((prev) => ({ ...prev, [dep.id]: undefined }));
@@ -140,7 +150,7 @@ export function DomainsView({
       });
       const data = await resp.json();
       if (!resp.ok) {
-        throw new Error(data.error || 'Failed to update domain.');
+        throw new Error(data.error || 'Failed to update link.');
       }
       if (data.networking) {
         setNetworkingMap((prev) => ({
@@ -152,6 +162,12 @@ export function DomainsView({
         setDomainInputs((prev) => ({
           ...prev,
           [dep.id]: (data.networking?.customDomain as string) || '',
+        }));
+      }
+      if (payload.appSlug !== undefined && data.networking?.appSlug) {
+        setSlugInputs((prev) => ({
+          ...prev,
+          [dep.id]: String(data.networking.appSlug),
         }));
       }
       if (data.deployment) {
@@ -168,9 +184,11 @@ export function DomainsView({
               ? payload.publicAppEnabled
                 ? 'Public Railway & custom domain links enabled.'
                 : 'Public links disabled for this bot.'
-              : savedDomain
-                ? `Saved "${savedDomain}". Point a CNAME record to ${activeRailwayHost} and click Verify DNS.`
-                : 'Custom domain removed.',
+              : payload.appSlug !== undefined
+                ? `Updated app link to ${data.networking?.pathAppUrl || `/app/${data.networking?.appSlug}/`}.`
+                : savedDomain
+                  ? `Saved "${savedDomain}". Point a CNAME record to ${activeRailwayHost} and click Verify DNS.`
+                  : 'Custom domain removed.',
         },
       }));
     } catch (err) {
@@ -485,15 +503,38 @@ export function DomainsView({
                       <div className="rounded-md border border-red-950/75 bg-[#080305] p-3 space-y-1.5">
                         <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-200">
                           <Link2 className="h-3.5 w-3.5 text-red-400" />
-                          <span>Railway / Server App URL</span>
+                          <span>Editable Railway / Server App URL</span>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="text"
-                            readOnly
-                            value={pathUrl}
-                            className="flex-1 min-w-0 rounded border border-red-950/80 bg-[#12070a] px-2.5 py-1.5 font-mono text-[11px] text-rose-200"
-                          />
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="flex flex-1 min-w-[200px] items-center rounded border border-red-950/80 bg-[#12070a] px-2.5 py-1.5 font-mono text-[11px]">
+                            <span className="text-slate-500 shrink-0 select-none">
+                              {preferences.railwayDomain ? `https://${preferences.railwayDomain}/app/` : '/app/'}
+                            </span>
+                            <input
+                              type="text"
+                              value={slugInputs[dep.id] ?? info?.appSlug ?? dep.appSlug ?? ''}
+                              onChange={(e) =>
+                                setSlugInputs((prev) => ({ ...prev, [dep.id]: e.target.value }))
+                              }
+                              placeholder="my-app"
+                              className="min-w-0 flex-1 bg-transparent text-rose-200 placeholder:text-slate-600 focus:outline-none"
+                            />
+                            <span className="text-slate-500 shrink-0 select-none">/</span>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={Boolean(busy)}
+                            onClick={() =>
+                              void handleSaveDomain(
+                                dep,
+                                { appSlug: slugInputs[dep.id] ?? info?.appSlug ?? dep.appSlug ?? '' },
+                                'slug'
+                              )
+                            }
+                            className="rounded bg-emerald-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-emerald-500 disabled:opacity-50 shrink-0"
+                          >
+                            {busy === 'slug' ? 'Saving...' : 'Save Link'}
+                          </button>
                           <button
                             type="button"
                             onClick={() => void copyValue(`app_${dep.id}`, pathUrl)}

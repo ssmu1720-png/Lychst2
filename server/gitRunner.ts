@@ -318,6 +318,87 @@ function parseEcosystemTarget(botDir: string, fileName: string): { script: strin
   }
 }
 
+function writeStaticWebServerScript(botDir: string): void {
+  const scriptPath = path.join(botDir, '.lyrihost_static_server.cjs');
+  const script = `'use strict';
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+
+const port = Number.parseInt(process.env.PORT || '3000', 10) || 3000;
+const cwd = process.cwd();
+const candidates = ['dist', 'build', 'out', 'public', '.'];
+const rootDir =
+  candidates
+    .map((dir) => path.resolve(cwd, dir))
+    .find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || cwd;
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.cjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.wasm': 'application/wasm',
+  '.txt': 'text/plain; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
+};
+
+const server = http.createServer((req, res) => {
+  const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  if (urlPath === '/health' && !fs.existsSync(path.join(rootDir, 'health'))) {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  let rel = urlPath.replace(/^\\/+/, '');
+  let target = path.resolve(rootDir, rel);
+  if (!target.startsWith(rootDir)) {
+    res.writeHead(403);
+    res.end('Forbidden');
+    return;
+  }
+
+  if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+    target = path.join(target, 'index.html');
+  }
+
+  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+    const spaIndex = path.join(rootDir, 'index.html');
+    if (fs.existsSync(spaIndex)) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      fs.createReadStream(spaIndex).pipe(res);
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not Found');
+    return;
+  }
+
+  const ext = path.extname(target).toLowerCase();
+  res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+  fs.createReadStream(target).pipe(res);
+});
+
+server.listen(port, '0.0.0.0', () => {
+  console.log('Lyrihost static web server listening on http://0.0.0.0:' + port + ' (root: ' + rootDir + ')');
+});
+`;
+  fs.writeFileSync(scriptPath, script, 'utf-8');
+}
+
 export function resolveDeploymentCommands(
   botDir: string,
   settings: Pick<BotSettings, 'installCommand' | 'buildCommand' | 'startCommand' | 'runtime'>
@@ -369,6 +450,18 @@ export function resolveDeploymentCommands(
       /--experimental-sqlite/i.test(pkg.scripts?.start || '')
     ) {
       runtime = 'node-22';
+    }
+
+    // Auto-enable build step for React/Vite/Next/TypeScript web repositories when buildCommand was left blank
+    if (
+      !buildCommand &&
+      pkg.scripts?.build &&
+      /\b(?:vite|next|react-scripts|astro|nuxt|svelte|remix|webpack|parcel|esbuild|tsup|rollup|tsc|vue-cli-service|gulp|tailwindcss)\b/i.test(
+        pkg.scripts.build
+      )
+    ) {
+      buildCommand = 'npm run build';
+      notes.push(`Detected web/TypeScript build script ("${pkg.scripts.build}"); auto-enabled npm run build.`);
     }
 
     // Adapt package managers not installed in runtime or brittle frozen/ci commands
@@ -468,6 +561,17 @@ export function resolveDeploymentCommands(
           notes.push(`Adapted Bun script to Node execution (${startCommand}).`);
         }
       }
+    } else if (
+      isDefaultStart &&
+      pkg.scripts?.start &&
+      /\bvite(?:\s+preview)?\b/i.test(pkg.scripts.start)
+    ) {
+      if (pkg.scripts?.build && !buildCommand) {
+        buildCommand = 'npm run build';
+      }
+      writeStaticWebServerScript(botDir);
+      startCommand = 'node .lyrihost_static_server.cjs';
+      notes.push('Adapted Vite static/preview app to Lyrihost built-in SPA web server.');
     } else if (isDefaultStart && (!pkg.scripts || !pkg.scripts.start)) {
       const procUnwrapped = procfileCmd ? unwrapStartTarget(procfileCmd) || procfileCmd : null;
       if (procUnwrapped && !/\b(npm|yarn|pnpm|bun)\s+(run\s+)?start\b/i.test(procUnwrapped)) {
@@ -508,6 +612,18 @@ export function resolveDeploymentCommands(
             startCommand = `node ${JSON.stringify(matchedEntry)}`;
             notes.push(`package.json has no "start" script; auto-selected entrypoint ${matchedEntry}.`);
           }
+        } else if (
+          pkg.scripts?.build ||
+          ['dist/index.html', 'build/index.html', 'out/index.html', 'public/index.html', 'index.html'].some(
+            (rel) => fs.existsSync(path.join(botDir, rel))
+          )
+        ) {
+          if (pkg.scripts?.build && !buildCommand) {
+            buildCommand = 'npm run build';
+          }
+          writeStaticWebServerScript(botDir);
+          startCommand = 'node .lyrihost_static_server.cjs';
+          notes.push('Frontend web repository detected with no start script; configured built-in static/SPA web server.');
         }
       }
     } else if (/^\s*bun\s+(run\s+)?start\b/i.test(startCommand) && !commandExists('bun')) {
@@ -547,6 +663,17 @@ export function resolveDeploymentCommands(
         notes.push(`Detected Python entrypoint (${foundPyEntry}); adapted start command.`);
       }
     }
+  } else if (
+    ['index.html', 'public/index.html', 'dist/index.html', 'build/index.html'].some((rel) =>
+      fs.existsSync(path.join(botDir, rel))
+    )
+  ) {
+    runtime = 'node-20';
+    installCommand = '';
+    buildCommand = '';
+    writeStaticWebServerScript(botDir);
+    startCommand = 'node .lyrihost_static_server.cjs';
+    notes.push('Detected static HTML website repository; configured built-in web server.');
   }
 
   // Ensure `python` works even if only `python3` is in PATH
