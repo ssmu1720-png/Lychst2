@@ -7,6 +7,7 @@ import { BotInspectorView } from './components/BotInspectorView';
 import { CoinsView } from './components/CoinsView';
 import { CustomRepoDeployView } from './components/CustomRepoDeployView';
 import { DashboardView } from './components/DashboardView';
+import { DomainsView } from './components/DomainsView';
 import { LyrihostLogo } from './components/LyrihostLogo';
 import { MatrixRainCanvas } from './components/MatrixRainCanvas';
 import { PlatformSettingsView } from './components/PlatformSettingsView';
@@ -35,6 +36,7 @@ const AUTH_STORAGE_KEY = 'lyrihost_auth_token';
 type ActiveRoute =
   | 'dashboard'
   | 'templates'
+  | 'domains'
   | 'custom'
   | 'coins'
   | 'support'
@@ -63,6 +65,7 @@ export default function App() {
   const [preferredPlanId, setPreferredPlanId] = useState<DeploymentPlanId>('plan_15d');
   const [deployments, setDeployments] = useState<BotDeployment[]>([]);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
+  const [inspectorTab, setInspectorTab] = useState<'logs' | 'settings' | 'networking' | 'security'>('logs');
   const [preferences, setPreferences] = useState<PlatformPreferences>(DEFAULT_PREFERENCES);
   const [loading, setLoading] = useState(true);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -511,6 +514,7 @@ export default function App() {
   }> = [
     { id: 'dashboard', label: 'Deployments' },
     { id: 'templates', label: 'Templates' },
+    { id: 'domains', label: 'Domains' },
     { id: 'coins', label: 'Coins' },
     { id: 'support', label: 'Support' },
     { id: 'settings', label: 'Settings' },
@@ -684,10 +688,13 @@ export default function App() {
             loading={loading}
             streamConnected={streamConnected}
             lastSyncTime={lastSyncTime}
-            onSelectBot={(id) => {
+            railwayDomain={preferences.railwayDomain}
+            onSelectBot={(id, tab = 'logs') => {
               setSelectedBotId(id);
+              setInspectorTab(tab);
               setRoute('inspector');
             }}
+            onOpenDomains={() => navigate('domains')}
             onOpenCustomDeploy={() => navigate('custom')}
             onOpenTemplates={() => navigate('templates')}
             onOpenCoins={() => navigate('coins')}
@@ -729,12 +736,37 @@ export default function App() {
             onDeployed={(created) => {
               setDeployments((prev) => [created, ...prev]);
               setSelectedBotId(created.id);
+              setInspectorTab('logs');
               setRoute('inspector');
               void refreshUser();
               if (firebaseUser?.emailVerified) {
                 void syncDeploymentToFirestore(firebaseUser, created).catch(() => {});
               }
             }}
+          />
+        )}
+
+        {route === 'domains' && (
+          <DomainsView
+            authToken={authToken}
+            deployments={deployments}
+            currentUser={currentUser}
+            preferences={preferences}
+            onDeploymentUpdated={(updated) => {
+              setDeployments((prev) =>
+                prev.map((d) => (d.id === updated.id ? updated : d))
+              );
+              if (firebaseUser?.emailVerified) {
+                void syncDeploymentToFirestore(firebaseUser, updated).catch(() => {});
+              }
+            }}
+            onSelectBot={(id, tab = 'logs') => {
+              setSelectedBotId(id);
+              setInspectorTab(tab);
+              setRoute('inspector');
+            }}
+            onOpenSettings={() => navigate('settings')}
+            onOpenCustomDeploy={() => navigate('custom')}
           />
         )}
 
@@ -816,6 +848,7 @@ export default function App() {
           <BotInspectorView
             authToken={authToken}
             deployment={selectedBot}
+            initialTab={inspectorTab}
             onBack={() => setRoute('dashboard')}
             onUpdated={(updated) => {
               setDeployments((prev) =>

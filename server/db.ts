@@ -394,6 +394,22 @@ function generateReferralCode(db: DatabaseSync): string {
   return `LYR-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
+export function detectEnvRailwayDomain(): string {
+  const raw =
+    process.env.RAILWAY_PUBLIC_DOMAIN?.trim() ||
+    process.env.RAILWAY_STATIC_URL?.trim() ||
+    '';
+  if (!raw) return '';
+  return raw
+    .toLowerCase()
+    .replace(/^https?:\/\//i, '')
+    .split('/')[0]
+    .split('?')[0]
+    .split('#')[0]
+    .split(':')[0]
+    .replace(/\.+$/, '');
+}
+
 export function getDefaultPreferences(): PlatformPreferences {
   return {
     defaultRegion: 'us-east',
@@ -408,6 +424,8 @@ export function getDefaultPreferences(): PlatformPreferences {
     webhookSecret: `lh_wh_${crypto.randomBytes(12).toString('hex')}`,
     promoEmailsOptIn: true,
     lowCoinAlertThreshold: 10,
+    railwayDomain: detectEnvRailwayDomain(),
+    platformWildcardDomain: process.env.APP_WILDCARD_DOMAIN?.trim() || '',
   };
 }
 
@@ -610,6 +628,9 @@ export function getUserPreferences(userId: string): PlatformPreferences {
   return {
     ...globalPrefs,
     ...userParsed,
+    railwayDomain: globalPrefs.railwayDomain || detectEnvRailwayDomain() || '',
+    platformWildcardDomain:
+      globalPrefs.platformWildcardDomain || process.env.APP_WILDCARD_DOMAIN?.trim() || '',
     promoEmailsOptIn: user.promo_emails_opt_in === 1,
     githubTokenConfigured: Boolean(getMeta('github_token') || process.env.GITHUB_TOKEN),
   };

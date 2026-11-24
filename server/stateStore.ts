@@ -18,6 +18,41 @@ import {
 
 export { makeId, nowIso };
 
+const NODE_RUNTIMES = new Set(['node-20', 'node-22', 'bun-1']);
+
+export function isNodeRuntimeDeployment(dep: BotDeployment): boolean {
+  return NODE_RUNTIMES.has(dep.settings?.runtime || '');
+}
+
+export function generateMonitorToken(): string {
+  return crypto.randomBytes(8).toString('hex');
+}
+
+export function generateUniqueAppSlug(
+  name: string,
+  existingDeployments: BotDeployment[],
+  excludeId?: string
+): string {
+  const used = new Set(
+    existingDeployments
+      .filter((d) => d.id !== excludeId && d.appSlug)
+      .map((d) => d.appSlug!.toLowerCase())
+  );
+  const base =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 26) || 'node-app';
+
+  for (let i = 0; i < 6; i++) {
+    const suffix = crypto.randomBytes(2).toString('hex');
+    const candidate = `${base}-${suffix}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `${base}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
 export interface PersistedState {
   nextNumericId: number;
   deployments: BotDeployment[];
@@ -77,6 +112,17 @@ export function normalizeState(loaded: PersistedState): PersistedState {
     if (typeof dep.healthScore !== 'number') dep.healthScore = 0;
     if (!Array.isArray(dep.telemetryHistory) || dep.telemetryHistory.length === 0) {
       dep.telemetryHistory = buildEmptyTelemetryHistory();
+    }
+    if (isNodeRuntimeDeployment(dep)) {
+      if (!dep.appSlug) {
+        dep.appSlug = generateUniqueAppSlug(dep.name, loaded.deployments, dep.id);
+      }
+      if (!dep.monitorToken) {
+        dep.monitorToken = generateMonitorToken();
+      }
+      if (typeof dep.publicAppEnabled !== 'boolean') {
+        dep.publicAppEnabled = true;
+      }
     }
   }
   loaded.nextNumericId = maxId;

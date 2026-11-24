@@ -10,6 +10,7 @@ import {
   Cpu,
   Flame,
   GitBranch,
+  Globe,
   HeartPulse,
   Layers,
   LayoutGrid,
@@ -39,7 +40,9 @@ interface DashboardViewProps {
   loading: boolean;
   streamConnected: boolean;
   lastSyncTime: string;
-  onSelectBot: (botId: string) => void;
+  railwayDomain?: string;
+  onSelectBot: (botId: string, tab?: 'logs' | 'settings' | 'networking' | 'security') => void;
+  onOpenDomains: () => void;
   onOpenCustomDeploy: () => void;
   onOpenTemplates: () => void;
   onOpenCoins: () => void;
@@ -324,7 +327,9 @@ export function DashboardView({
   loading,
   streamConnected,
   lastSyncTime,
+  railwayDomain,
   onSelectBot,
+  onOpenDomains,
   onOpenCustomDeploy,
   onOpenTemplates,
   onOpenCoins,
@@ -486,6 +491,15 @@ export function DashboardView({
           >
             <Coins className="h-3.5 w-3.5 text-red-400" />
             Buy / Transfer Coins
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenDomains}
+            className="inline-flex items-center gap-1.5 rounded-md border border-red-950/90 bg-[#080305] px-3 py-1.5 text-[11px] font-medium text-slate-300 transition-colors hover:border-red-500/40 hover:text-slate-100 whitespace-nowrap shrink-0"
+          >
+            <Globe className="h-3.5 w-3.5 text-emerald-400" />
+            Domains
           </button>
 
           <button
@@ -796,6 +810,52 @@ export function DashboardView({
                       </div>
 
                       <div className="flex items-center gap-1">
+                        {(dep.settings.runtime === 'node-20' ||
+                          dep.settings.runtime === 'node-22' ||
+                          dep.settings.runtime === 'bun-1') && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectBot(dep.id, 'networking');
+                            }}
+                            title={
+                              dep.customDomain
+                                ? `Change custom domain (${dep.customDomain})`
+                                : 'Add or change custom domain'
+                            }
+                            className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium transition-colors ${
+                              dep.customDomain
+                                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25'
+                                : 'border-red-950/90 bg-[#080305] text-slate-300 hover:border-red-500/45'
+                            }`}
+                          >
+                            {dep.customDomain ? dep.customDomain : 'Domain'}
+                          </button>
+                        )}
+                        {dep.status === 'online' &&
+                          dep.publicAppEnabled !== false &&
+                          dep.appSlug &&
+                          (dep.settings.runtime === 'node-20' ||
+                            dep.settings.runtime === 'node-22' ||
+                            dep.settings.runtime === 'bun-1') && (
+                            <a
+                              href={
+                                dep.customDomain
+                                  ? `https://${dep.customDomain}/`
+                                  : railwayDomain
+                                    ? `https://${railwayDomain}/app/${dep.appSlug}/`
+                                    : `/app/${dep.appSlug}/`
+                              }
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              title="Open Node App / Web Endpoint"
+                              className="rounded border border-emerald-500/35 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20"
+                            >
+                              Open
+                            </a>
+                          )}
                         <button
                           type="button"
                           onClick={(e) => {

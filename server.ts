@@ -17,6 +17,7 @@ import { createBotsRouter } from './server/botsRouter.ts';
 import {
   buildAuthUser,
   deleteDeploymentFromDb,
+  detectEnvRailwayDomain,
   flushDbToDisk,
   getDeploymentPlan,
   getMeta,
@@ -59,9 +60,22 @@ import {
 } from './server/processManager.ts';
 import { getEmailTransportStatus } from './server/emailService.ts';
 import { BotDeploymentEngine } from './server/deployEngine.ts';
+import {
+  buildDeploymentNetworkingInfo,
+  extractRequestHost,
+  isNodeHostedRuntime,
+  normalizeHostname,
+  proxyHttpRequest,
+  proxyWebSocketUpgrade,
+  resolveDeploymentByProxyRequest,
+  supportsPublicEndpoints,
+  verifyCustomDomainDns,
+} from './server/appProxy.ts';
 import { TEMPLATE_BOTS } from './src/catalog/templateBots.ts';
 import {
   buildEmptyTelemetryHistory,
+  generateMonitorToken,
+  generateUniqueAppSlug,
   loadState,
   makeId,
   nowIso,
@@ -1066,12 +1080,122 @@ function appendLog(dep: BotDeployment, level: LogEntry['level'], stage: string, 
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
+
+  const getEffectiveWildcardDomain = (): string =>
+    normalizeHostname(state.preferences.platformWildcardDomain || process.env.APP_WILDCARD_DOMAIN || '') || '';
+
+  // Auto-detect live public origin so PaaS keepalive & public app links work without manual APP_URL env
+  let learnedPublicOrigin = getMeta('public_keepalive_origin') || '';
+
+  const getEffectiveRailwayDomain = (): {
+    domain: string;
+    source: 'preference' | 'env' | 'detected' | 'none';
+  } => {
+    const prefDomain = state.preferences.railwayDomain
+      ? normalizeHostname(state.preferences.railwayDomain)
+      : null;
+    if (prefDomain) {
+      return { domain: prefDomain, source: 'preference' };
+    }
+    const envHost = normalizeHostname(detectEnvRailwayDomain());
+    if (envHost) {
+      return { domain: envHost, source: 'env' };
+    }
+    if (learnedPublicOrigin) {
+      try {
+        const learnedHost = normalizeHostname(new URL(learnedPublicOrigin).hostname);
+        if (learnedHost && learnedHost.endsWith('.up.railway.app')) {
+          return { domain: learnedHost, source: 'detected' };
+        }
+      } catch {
+        // ignore invalid learned origin
+      }
+    }
+    return { domain: '', source: 'none' };
+  };
+
+  const resolveRequestPublicContext = (req?: express.Request): {
+    origin: string;
+    serverHost: string;
+    railwayDomain: string;
+    railwayDomainSource: 'preference' | 'env' | 'detected' | 'none';
+  } => {
+    const rawHost = req
+      ? (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0].trim()
+      : '';
+    const rawProto = req
+      ? (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim()
+      : 'https';
+
+    const railway = getEffectiveRailwayDomain();
+    const envExternal =
+      (railway.domain ? `https://${railway.domain}` : '') ||
+      process.env.APP_URL?.trim() ||
+      process.env.PUBLIC_URL?.trim() ||
+      process.env.RENDER_EXTERNAL_URL?.trim() ||
+      '';
+
+    const hostOnly = extractRequestHost(rawHost);
+    const wildcard = getEffectiveWildcardDomain();
+    const isUserHost = Boolean(
+      hostOnly &&
+        (state.deployments.some((d) => d.customDomain && d.customDomain === hostOnly) ||
+          (wildcard && hostOnly.endsWith(`.${wildcard}`)))
+    );
+
+    let origin = envExternal || learnedPublicOrigin;
+    if (railway.domain) {
+      origin = `https://${railway.domain}`;
+    } else if (
+      !isUserHost &&
+      rawHost &&
+      !/^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(rawHost) &&
+      !/\.internal(:\d+)?$/i.test(rawHost)
+    ) {
+      origin = `${rawProto === 'https' ? 'https' : 'http'}://${rawHost}`;
+    } else if (!origin && rawHost) {
+      origin = `${rawProto === 'https' ? 'https' : 'http'}://${rawHost}`;
+    }
+
+    let serverHost = railway.domain;
+    if (!serverHost && origin) {
+      try {
+        serverHost = new URL(origin).hostname;
+      } catch {
+        serverHost = extractRequestHost(rawHost);
+      }
+    } else if (!serverHost && rawHost) {
+      serverHost = extractRequestHost(rawHost);
+    }
+
+    return {
+      origin: origin.replace(/\/+$/, ''),
+      serverHost,
+      railwayDomain: railway.domain,
+      railwayDomainSource: railway.source,
+    };
+  };
+
+  // Reverse-proxy incoming requests for custom domains, <slug>.<wildcard>, or /app/<slug>/ BEFORE express.json()
+  app.use((req, res, next) => {
+    const match = resolveDeploymentByProxyRequest(
+      req.originalUrl || req.url || '/',
+      req.headers['x-forwarded-host'] || req.headers.host,
+      state.deployments,
+      getEffectiveWildcardDomain()
+    );
+    if (match) {
+      proxyHttpRequest(req, res, match);
+      return;
+    }
+    next();
+  });
+
   app.use(cors());
   app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true }));
 
-  // Auto-detect live public origin so PaaS keepalive pings external ingress even without manual APP_URL env
-  let learnedPublicOrigin = getMeta('public_keepalive_origin') || '';
   app.use((req, _res, next) => {
     const rawHost = (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0].trim();
     const rawProto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim();
@@ -1080,13 +1204,21 @@ async function startServer() {
       !/^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(rawHost) &&
       !/\.internal(:\d+)?$/i.test(rawHost)
     ) {
-      const origin = `${rawProto === 'https' ? 'https' : 'http'}://${rawHost}`;
-      if (origin !== learnedPublicOrigin) {
-        learnedPublicOrigin = origin;
-        try {
-          setMeta('public_keepalive_origin', origin);
-        } catch {
-          // ignore meta write error
+      // Only learn main platform origins, never user-app subdomains or custom domains
+      const hostOnly = extractRequestHost(rawHost);
+      const wildcard = getEffectiveWildcardDomain();
+      const isUserDomain =
+        state.deployments.some((d) => d.customDomain && d.customDomain === hostOnly) ||
+        Boolean(wildcard && hostOnly.endsWith(`.${wildcard}`));
+      if (!isUserDomain) {
+        const origin = `${rawProto === 'https' ? 'https' : 'http'}://${rawHost}`;
+        if (origin !== learnedPublicOrigin) {
+          learnedPublicOrigin = origin;
+          try {
+            setMeta('public_keepalive_origin', origin);
+          } catch {
+            // ignore meta write error
+          }
         }
       }
     }
@@ -1138,6 +1270,66 @@ async function startServer() {
     });
   });
 
+  // Public UptimeRobot / external monitor endpoint (Node apps & Node bots only; returns 200 UP / 503 DOWN)
+  app.all('/up/:id/:token', async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.status(405).json({ error: 'Method not allowed' });
+      return;
+    }
+
+    const dep = state.deployments.find((d) => d.id === req.params.id);
+    if (
+      !dep ||
+      !supportsPublicEndpoints(dep) ||
+      dep.publicAppEnabled === false ||
+      !dep.monitorToken ||
+      dep.monitorToken !== req.params.token
+    ) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(404).json({ status: 'NOT_FOUND', error: 'Monitor endpoint not found or disabled.' });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+
+    const isExpired = Boolean(dep.expiresAt && Date.parse(dep.expiresAt) <= Date.now());
+    const portEntry = dep.settings.envVars.find((v) => v.key === 'PORT' || v.key === 'WEB_PORT');
+    const customPort = portEntry ? Number.parseInt(portEntry.value.trim(), 10) : null;
+    const probe = await probeBotProcessHealth({
+      botId: dep.id,
+      numericId: dep.numericId,
+      fallbackPid: dep.pid,
+      customPort: Number.isInteger(customPort) ? customPort : null,
+      healthCheckPath: dep.settings.healthCheckPath,
+    });
+
+    const isUp =
+      !isExpired &&
+      dep.status === 'online' &&
+      probe.processAlive &&
+      probe.osState !== 'Z';
+
+    const payload = {
+      status: isUp ? 'UP' : 'DOWN',
+      name: dep.name,
+      platform: dep.platform,
+      runtime: dep.settings.runtime,
+      state: isExpired ? 'expired' : dep.status,
+      pidAlive: probe.processAlive,
+      uptimeSeconds: isUp ? Math.max(dep.uptimeSeconds, Math.round(probe.uptimeMs / 1000)) : 0,
+      httpListening: probe.httpProbe.listening,
+      httpStatusCode: probe.httpProbe.statusCode,
+      latencyMs: probe.httpProbe.latencyMs,
+      checkedAt: nowIso(),
+    };
+
+    if (req.method === 'HEAD') {
+      res.status(isUp ? 200 : 503).end();
+      return;
+    }
+    res.status(isUp ? 200 : 503).json(payload);
+  });
+
   // Curated + Admin-added WhatsApp & Multi-Device Bot Templates
   app.get('/api/templates', (_req, res) => {
     const customTemplates = listCustomBotTemplates();
@@ -1167,13 +1359,19 @@ async function startServer() {
 
   // Platform preferences (per-user persisted in SQLite when authenticated)
   app.get('/api/preferences', (req, res) => {
+    const railway = getEffectiveRailwayDomain();
     const user = resolveAuthenticatedUser(req);
     if (user) {
-      res.json(getUserPreferences(user.id));
+      const prefs = getUserPreferences(user.id);
+      res.json({
+        ...prefs,
+        railwayDomain: prefs.railwayDomain || railway.domain,
+      });
       return;
     }
     res.json({
       ...state.preferences,
+      railwayDomain: state.preferences.railwayDomain || railway.domain,
       githubTokenConfigured: Boolean(state.githubToken || process.env.GITHUB_TOKEN),
     });
   });
@@ -1211,15 +1409,54 @@ async function startServer() {
     if (typeof body.webhookSecret === 'string' && body.webhookSecret.trim()) {
       state.preferences.webhookSecret = body.webhookSecret.trim();
     }
+    if (typeof body.railwayDomain === 'string' && (!user || isAdminEmail(user.email))) {
+      const cleanedRailway = body.railwayDomain.trim();
+      if (!cleanedRailway) {
+        state.preferences.railwayDomain = '';
+        body.railwayDomain = '';
+      } else {
+        const normalizedRailway = normalizeHostname(cleanedRailway);
+        if (!normalizedRailway) {
+          res.status(400).json({
+            error: 'Enter a valid Railway domain (for example: lyrihost-production.up.railway.app).',
+          });
+          return;
+        }
+        state.preferences.railwayDomain = normalizedRailway;
+        body.railwayDomain = normalizedRailway;
+      }
+    }
+    if (typeof body.platformWildcardDomain === 'string' && (!user || isAdminEmail(user.email))) {
+      const cleanedWildcard = body.platformWildcardDomain.trim();
+      if (!cleanedWildcard) {
+        state.preferences.platformWildcardDomain = '';
+        body.platformWildcardDomain = '';
+      } else {
+        const normalizedWildcard = normalizeHostname(cleanedWildcard);
+        if (!normalizedWildcard) {
+          res.status(400).json({ error: 'Enter a valid domain name for Platform Wildcard Domain (e.g. lyrihost.site).' });
+          return;
+        }
+        state.preferences.platformWildcardDomain = normalizedWildcard;
+        body.platformWildcardDomain = normalizedWildcard;
+      }
+    }
     state.preferences.githubTokenConfigured = Boolean(state.githubToken || process.env.GITHUB_TOKEN);
     saveState();
 
+    const railway = getEffectiveRailwayDomain();
     if (user) {
       const updatedUserPrefs = saveUserPreferences(user.id, body);
-      res.json(updatedUserPrefs);
+      res.json({
+        ...updatedUserPrefs,
+        railwayDomain: updatedUserPrefs.railwayDomain || railway.domain,
+      });
       return;
     }
-    res.json(state.preferences);
+    res.json({
+      ...state.preferences,
+      railwayDomain: state.preferences.railwayDomain || railway.domain,
+    });
   });
 
   // Real GitHub Repository Scanner
@@ -1300,6 +1537,7 @@ async function startServer() {
       commitSha,
       gitToken,
       planId: requestedPlanId,
+      customDomain: requestedCustomDomain,
       settings,
       scanReport,
     } = req.body as {
@@ -1310,6 +1548,7 @@ async function startServer() {
       commitSha?: string;
       gitToken?: string;
       planId?: DeploymentPlanId;
+      customDomain?: string | null;
       settings?: BotSettings;
       scanReport?: GitHubScanResult | null;
     };
@@ -1343,6 +1582,34 @@ async function startServer() {
         error: `Deployment blocked by Lyrihost Acceptable Use Policy: detected prohibited "${matchedProhibition.label}" pattern. Bug bots and harmful scripts are strictly prohibited.`,
       });
       return;
+    }
+
+    const isNode = isNodeHostedRuntime(settings.runtime);
+    let initialCustomDomain: string | null = null;
+    if (typeof requestedCustomDomain === 'string' && requestedCustomDomain.trim()) {
+      if (!isNode) {
+        res.status(400).json({
+          error: 'Custom domains are supported for Node.js apps and Node bots only.',
+        });
+        return;
+      }
+      const normalized = normalizeHostname(requestedCustomDomain);
+      if (!normalized) {
+        res.status(400).json({
+          error: 'Enter a valid custom domain (for example: app.yourdomain.com). IP addresses and localhost are not allowed.',
+        });
+        return;
+      }
+      const conflict = state.deployments.find(
+        (other) => other.customDomain?.toLowerCase() === normalized
+      );
+      if (conflict) {
+        res.status(409).json({
+          error: `Domain "${normalized}" is already connected to another deployment.`,
+        });
+        return;
+      }
+      initialCustomDomain = normalized;
     }
 
     const resolvedPlanId: DeploymentPlanId =
@@ -1414,6 +1681,15 @@ async function startServer() {
       totalChecks: 0,
       uptimePercentage: 0,
       healthScore: 0,
+      ...(isNode
+        ? {
+            appSlug: generateUniqueAppSlug(settings.name.trim(), state.deployments, botId),
+            monitorToken: generateMonitorToken(),
+            publicAppEnabled: true,
+            customDomain: initialCustomDomain,
+            customDomainVerified: false,
+          }
+        : {}),
       telemetryHistory: buildEmptyTelemetryHistory(),
       settings: {
         ...settings,
@@ -1430,6 +1706,141 @@ async function startServer() {
     saveState();
     void deployEngine.deploy(newDeployment);
     res.status(201).json(newDeployment);
+  });
+
+  // Public App Links, UptimeRobot Monitor URL & In-App Custom Domain APIs (Node apps & Node bots)
+  app.get('/api/deployments/:id/networking', (req, res) => {
+    const dep = state.deployments.find((d) => d.id === req.params.id);
+    if (!dep || !canManageDeployment(req, dep)) {
+      res.status(404).json({ error: 'Deployment not found.' });
+      return;
+    }
+    const { origin, serverHost, railwayDomain, railwayDomainSource } = resolveRequestPublicContext(req);
+    res.json(
+      buildDeploymentNetworkingInfo({
+        dep,
+        origin,
+        serverHost,
+        railwayDomain,
+        railwayDomainSource,
+        platformWildcardDomain: getEffectiveWildcardDomain(),
+      })
+    );
+  });
+
+  app.patch('/api/deployments/:id/domain', (req, res) => {
+    const dep = state.deployments.find((d) => d.id === req.params.id);
+    if (!dep) {
+      res.status(404).json({ error: 'Deployment not found.' });
+      return;
+    }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to update this domain.' });
+      return;
+    }
+    if (!supportsPublicEndpoints(dep)) {
+      res.status(400).json({
+        error: 'Public web access and custom domains are available for Node.js apps and Node bots only.',
+      });
+      return;
+    }
+
+    const { customDomain, publicAppEnabled } = (req.body ?? {}) as {
+      customDomain?: string | null;
+      publicAppEnabled?: boolean;
+    };
+
+    if (typeof publicAppEnabled === 'boolean') {
+      dep.publicAppEnabled = publicAppEnabled;
+    }
+
+    if (customDomain !== undefined) {
+      const raw = (customDomain || '').trim();
+      if (!raw) {
+        dep.customDomain = null;
+        dep.customDomainVerified = false;
+      } else {
+        const normalized = normalizeHostname(raw);
+        if (!normalized) {
+          res.status(400).json({
+            error: 'Enter a valid domain or subdomain (for example: app.yourdomain.com). IP addresses and localhost are not allowed.',
+          });
+          return;
+        }
+        const conflict = state.deployments.find(
+          (other) => other.id !== dep.id && other.customDomain?.toLowerCase() === normalized
+        );
+        if (conflict) {
+          res.status(409).json({
+            error: `Domain "${normalized}" is already connected to another deployment.`,
+          });
+          return;
+        }
+        if (dep.customDomain !== normalized) {
+          dep.customDomain = normalized;
+          dep.customDomainVerified = false;
+        }
+      }
+    }
+
+    if (!dep.appSlug) {
+      dep.appSlug = generateUniqueAppSlug(dep.name, state.deployments, dep.id);
+    }
+    if (!dep.monitorToken) {
+      dep.monitorToken = generateMonitorToken();
+    }
+    dep.updatedAt = nowIso();
+    saveState();
+    broadcastDeployments();
+
+    const { origin, serverHost, railwayDomain, railwayDomainSource } = resolveRequestPublicContext(req);
+    res.json({
+      deployment: dep,
+      networking: buildDeploymentNetworkingInfo({
+        dep,
+        origin,
+        serverHost,
+        railwayDomain,
+        railwayDomainSource,
+        platformWildcardDomain: getEffectiveWildcardDomain(),
+      }),
+    });
+  });
+
+  app.post('/api/deployments/:id/domain/verify', async (req, res) => {
+    const dep = state.deployments.find((d) => d.id === req.params.id);
+    if (!dep) {
+      res.status(404).json({ error: 'Deployment not found.' });
+      return;
+    }
+    if (!canManageDeployment(req, dep)) {
+      res.status(403).json({ error: 'You do not have permission to verify this domain.' });
+      return;
+    }
+    if (!supportsPublicEndpoints(dep) || !dep.customDomain) {
+      res.status(400).json({ error: 'Save a custom domain first before running DNS verification.' });
+      return;
+    }
+
+    const { origin, serverHost, railwayDomain, railwayDomainSource } = resolveRequestPublicContext(req);
+    const result = await verifyCustomDomainDns(dep.customDomain, railwayDomain || serverHost);
+    dep.customDomainVerified = result.verified;
+    dep.updatedAt = nowIso();
+    saveState();
+    broadcastDeployments();
+
+    res.json({
+      ...result,
+      deployment: dep,
+      networking: buildDeploymentNetworkingInfo({
+        dep,
+        origin,
+        serverHost,
+        railwayDomain,
+        railwayDomainSource,
+        platformWildcardDomain: getEffectiveWildcardDomain(),
+      }),
+    });
   });
 
   // Renew or upgrade an existing bot's hosting plan & RAM allocation
@@ -1875,18 +2286,29 @@ async function startServer() {
     });
   }
 
-  // HTTP + WebSocket Server (/ws/bots/:id/terminal) ported from wh-panel-site
+  // HTTP + WebSocket Server (/ws/bots/:id/terminal + proxied Node app WebSockets)
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (request, socket, head) => {
     const url = request.url ?? '';
     const match = url.match(/\/ws\/bots\/([A-Za-z0-9_-]+)\/terminal/);
-    if (!match) return;
+    if (match) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request, match[1]);
+      });
+      return;
+    }
 
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request, match[1]);
-    });
+    const proxyMatch = resolveDeploymentByProxyRequest(
+      url,
+      request.headers['x-forwarded-host'] || request.headers.host,
+      state.deployments,
+      getEffectiveWildcardDomain()
+    );
+    if (proxyMatch) {
+      proxyWebSocketUpgrade(request, socket, head, proxyMatch);
+    }
   });
 
   wss.on('connection', (ws: WebSocket, _req: http.IncomingMessage, rawBotKey: string) => {
@@ -1960,7 +2382,10 @@ async function startServer() {
 
       fetch(localKeepaliveUrl, { method: 'GET', signal: AbortSignal.timeout(3000) }).catch(() => {});
 
-      const externalTarget = envExternal || learnedPublicOrigin;
+      const externalTarget =
+        (getEffectiveRailwayDomain().domain ? `https://${getEffectiveRailwayDomain().domain}` : '') ||
+        envExternal ||
+        learnedPublicOrigin;
       if (externalTarget && /^https?:\/\//i.test(externalTarget)) {
         const keepaliveUrl = `${externalTarget.replace(/\/+$/, '')}/api/health`;
         fetch(keepaliveUrl, { method: 'GET', signal: AbortSignal.timeout(5000) }).catch(() => {});

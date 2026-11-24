@@ -7,6 +7,8 @@ import {
   Copy,
   ExternalLink,
   GitBranch,
+  Globe,
+  Link2,
   Play,
   Rocket,
   RotateCw,
@@ -25,6 +27,7 @@ import {
   type BotSettings,
   type ComputeTier,
   type DeployRegion,
+  type DeploymentNetworkingInfo,
   type LogEntry,
   type RestartPolicy,
   type RuntimeEnvironment,
@@ -33,6 +36,7 @@ import {
 interface BotInspectorViewProps {
   authToken: string;
   deployment: BotDeployment;
+  initialTab?: 'logs' | 'settings' | 'networking' | 'security';
   onBack: () => void;
   onUpdated: (updated: BotDeployment) => void;
   onDeleted: (deletedId: string) => void;
@@ -54,11 +58,15 @@ function formatTime(iso: string): string {
 export function BotInspectorView({
   authToken,
   deployment,
+  initialTab = 'logs',
   onBack,
   onUpdated,
   onDeleted,
 }: BotInspectorViewProps) {
-  const [activeTab, setActiveTab] = useState<'logs' | 'settings' | 'security'>('logs');
+  const [activeTab, setActiveTab] = useState<'logs' | 'settings' | 'networking' | 'security'>(initialTab);
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab, deployment.id]);
   const [logLevelFilter, setLogLevelFilter] = useState<'all' | LogEntry['level']>('all');
   const [logSearch, setLogSearch] = useState('');
   const [copiedLogs, setCopiedLogs] = useState(false);
@@ -69,14 +77,57 @@ export function BotInspectorView({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  const isNodeDeployment =
+    deployment.settings.runtime === 'node-20' ||
+    deployment.settings.runtime === 'node-22' ||
+    deployment.settings.runtime === 'bun-1';
+
+  const [networking, setNetworking] = useState<DeploymentNetworkingInfo | null>(null);
+  const [domainInput, setDomainInput] = useState(deployment.customDomain || '');
+  const [domainBusy, setDomainBusy] = useState(false);
+  const [verifyBusy, setVerifyBusy] = useState(false);
+  const [dnsCheckResult, setDnsCheckResult] = useState<{ verified: boolean; message: string } | null>(null);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [uptimeProbeResult, setUptimeProbeResult] = useState<{ ok: boolean; text: string } | null>(null);
+
   const [draftSettings, setDraftSettings] = useState<BotSettings>(deployment.settings);
 
   // Keep draft settings synchronized when switching bots
   useEffect(() => {
     setDraftSettings(deployment.settings);
+    setDomainInput(deployment.customDomain || '');
+    setDnsCheckResult(null);
+    setUptimeProbeResult(null);
     setConfirmDelete(false);
     setFeedback(null);
   }, [deployment.id]);
+
+  useEffect(() => {
+    if (!isNodeDeployment) {
+      setNetworking(null);
+      if (activeTab === 'networking') setActiveTab('logs');
+      return;
+    }
+    let active = true;
+    const loadNetworking = async () => {
+      try {
+        const resp = await fetch(`/api/deployments/${deployment.id}/networking`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!resp.ok) return;
+        const data = (await resp.json()) as DeploymentNetworkingInfo;
+        if (active) {
+          setNetworking(data);
+        }
+      } catch {
+        // ignore transient fetch failure
+      }
+    };
+    void loadNetworking();
+    return () => {
+      active = false;
+    };
+  }, [deployment.id, deployment.customDomain, deployment.publicAppEnabled, deployment.appSlug, isNodeDeployment, authToken, activeTab]);
 
   const filteredLogs = useMemo(() => {
     const q = logSearch.trim().toLowerCase();
@@ -200,6 +251,101 @@ export function BotInspectorView({
       setTimeout(() => setCopiedLogs(false), 1800);
     } catch {
       // ignore clipboard restrictions
+    }
+  };
+
+  const copyLinkValue = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedField(key);
+      setTimeout(() => setCopiedField(null), 1800);
+    } catch {
+      // ignore clipboard restrictions
+    }
+  };
+
+  const handleDomainSave = async (opts: { customDomain?: string | null; publicAppEnabled?: boolean }) => {
+    setDomainBusy(true);
+    setFeedback(null);
+    setDnsCheckResult(null);
+    try {
+      const resp = await fetch(`/api/deployments/${deployment.id}/domain`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(opts),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Failed to update domain settings.');
+      if (data.deployment) onUpdated(data.deployment as BotDeployment);
+      if (data.networking) setNetworking(data.networking as DeploymentNetworkingInfo);
+      if (opts.customDomain !== undefined) {
+        setDomainInput((data.networking?.customDomain as string) || '');
+      }
+      setFeedback({
+        type: 'success',
+        text:
+          opts.publicAppEnabled !== undefined
+            ? `Public app & UptimeRobot links ${opts.publicAppEnabled ? 'enabled' : 'disabled'}.`
+            : opts.customDomain
+              ? 'Custom domain saved. Point your DNS CNAME record and click Verify DNS.'
+              : 'Custom domain removed.',
+      });
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to save domain.',
+      });
+    } finally {
+      setDomainBusy(false);
+    }
+  };
+
+  const handleVerifyDns = async () => {
+    setVerifyBusy(true);
+    setFeedback(null);
+    try {
+      const resp = await fetch(`/api/deployments/${deployment.id}/domain/verify`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'DNS verification failed.');
+      if (data.deployment) onUpdated(data.deployment as BotDeployment);
+      if (data.networking) setNetworking(data.networking as DeploymentNetworkingInfo);
+      setDnsCheckResult({
+        verified: Boolean(data.verified),
+        message: String(data.message || ''),
+      });
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'DNS verification failed.',
+      });
+    } finally {
+      setVerifyBusy(false);
+    }
+  };
+
+  const handleTestMonitorUrl = async (url: string) => {
+    setUptimeProbeResult(null);
+    try {
+      const resp = await fetch(url, { cache: 'no-store' });
+      const data = (await resp.json()) as {
+        status?: string;
+        httpListening?: boolean;
+        latencyMs?: number | null;
+      };
+      setUptimeProbeResult({
+        ok: resp.ok,
+        text: `HTTP ${resp.status} · ${data.status || (resp.ok ? 'UP' : 'DOWN')}${
+          data.httpListening ? ` · Web port listening (${data.latencyMs ?? 1}ms)` : ''
+        }`,
+      });
+    } catch {
+      setUptimeProbeResult({ ok: false, text: 'Unable to reach monitor endpoint.' });
     }
   };
 
@@ -394,7 +540,7 @@ export function BotInspectorView({
       )}
 
       {/* Workspace Tabs */}
-      <div className="flex items-center gap-1 rounded-lg border border-red-950/80 bg-[#0d0508] p-1 w-fit">
+      <div className="flex flex-wrap items-center gap-1 rounded-lg border border-red-950/80 bg-[#0d0508] p-1 w-fit">
         <button
           type="button"
           onClick={() => setActiveTab('logs')}
@@ -419,6 +565,20 @@ export function BotInspectorView({
           <Save className="h-3.5 w-3.5" />
           Settings & Env
         </button>
+        {isNodeDeployment && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('networking')}
+            className={`inline-flex items-center gap-2 rounded-md px-4 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'networking'
+                ? 'bg-red-600/20 text-red-300 border border-red-500/40'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            }`}
+          >
+            <Globe className="h-3.5 w-3.5" />
+            Links & Domain
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setActiveTab('security')}
@@ -687,6 +847,260 @@ export function BotInspectorView({
               Save & Redeploy
             </button>
           </div>
+        </section>
+      )}
+
+      {/* Tab 2.5: Public Links, UptimeRobot & Custom Domain (Node apps & Node bots) */}
+      {activeTab === 'networking' && isNodeDeployment && (
+        <section className="rounded-xl border border-red-500/25 bg-[#12070a]/95 p-6 space-y-6">
+          <div className="flex flex-col gap-3 border-b border-red-950/70 pb-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="font-display text-lg font-semibold text-slate-50">
+                App Access, UptimeRobot &amp; Custom Domain
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-400">
+                Available for Node.js apps and Node bots. Share your server link for web access, add an independent UptimeRobot check, or bind a custom domain.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={domainBusy}
+              onClick={() =>
+                void handleDomainSave({ publicAppEnabled: !(networking?.publicAppEnabled ?? true) })
+              }
+              className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                networking?.publicAppEnabled !== false
+                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                  : 'border-red-950/90 bg-[#0a0406] text-slate-300 hover:border-red-500/45'
+              }`}
+            >
+              {networking?.publicAppEnabled !== false ? 'Public Links Enabled' : 'Public Links Disabled'}
+            </button>
+          </div>
+
+          {networking && !networking.publicAppEnabled ? (
+            <div className="rounded-lg border border-dashed border-red-950/80 bg-[#0a0406] p-5 text-xs text-slate-400">
+              Public app proxy and UptimeRobot monitor links are disabled for this bot. Click{' '}
+              <span className="text-slate-200 font-medium">Public Links Disabled</span> above to re-enable them.
+            </div>
+          ) : (
+            <div className="space-y-5">
+              {/* Random Server App Link */}
+              <div className="rounded-lg border border-red-950/80 bg-[#0a0406] p-4 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-100">
+                    <Link2 className="h-3.5 w-3.5 text-red-400" />
+                    <span>
+                      {networking?.railwayDomain
+                        ? `Railway Public URL (Internal Port ${networking?.internalPort ?? '—'})`
+                        : `Live Node App URL (Internal Port ${networking?.internalPort ?? '—'})`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 font-mono text-[11px]">
+                    {networking?.railwayDomain && (
+                      <span className="rounded border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-emerald-300">
+                        Railway: {networking.railwayDomain}
+                      </span>
+                    )}
+                    <span className="text-slate-400">
+                      Slug: {networking?.appSlug || deployment.appSlug}
+                    </span>
+                  </div>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  Forwards HTTP &amp; WebSocket traffic through your Railway server domain directly to this Node process.
+                </p>
+                {networking?.pathAppUrl && (
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <input
+                      type="text"
+                      readOnly
+                      value={networking.pathAppUrl}
+                      className="flex-1 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 font-mono text-xs text-rose-200"
+                    />
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => void copyLinkValue('appUrl', networking.pathAppUrl!)}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 text-xs font-medium text-slate-200 hover:border-red-500/40"
+                      >
+                        {copiedField === 'appUrl' ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                        {copiedField === 'appUrl' ? 'Copied' : 'Copy'}
+                      </button>
+                      <a
+                        href={networking.pathAppUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-2 text-xs font-semibold text-white hover:bg-red-500"
+                      >
+                        Open App
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                    </div>
+                  </div>
+                )}
+
+                {networking?.subdomainAppUrl && (
+                  <div className="pt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <span className="text-[11px] text-slate-400 shrink-0">Platform Subdomain:</span>
+                    <input
+                      type="text"
+                      readOnly
+                      value={networking.subdomainAppUrl}
+                      className="flex-1 rounded-md border border-emerald-500/30 bg-[#12070a] px-3 py-1.5 font-mono text-xs text-emerald-300"
+                    />
+                    <a
+                      href={networking.subdomainAppUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-xs text-emerald-300 hover:underline shrink-0"
+                    >
+                      Open
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </div>
+                )}
+              </div>
+
+              {/* UptimeRobot Monitor Link */}
+              <div className="rounded-lg border border-red-950/80 bg-[#0a0406] p-4 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-100">
+                    <Activity className="h-3.5 w-3.5 text-emerald-400" />
+                    <span>UptimeRobot Independent Monitor URL</span>
+                  </div>
+                  <span className="font-mono text-[11px] text-emerald-400">
+                    200 UP · 503 DOWN
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  Add this URL as an <span className="text-slate-200">HTTP(s)</span> or <span className="text-slate-200">Keyword ("UP")</span> monitor in UptimeRobot. It checks real process health and returns HTTP 503 immediately if stopped or crashed.
+                </p>
+                {networking?.uptimeMonitorUrl && (
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <input
+                      type="text"
+                      readOnly
+                      value={networking.uptimeMonitorUrl}
+                      className="flex-1 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 font-mono text-xs text-emerald-300"
+                    />
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => void copyLinkValue('uptimeUrl', networking.uptimeMonitorUrl!)}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 text-xs font-medium text-slate-200 hover:border-red-500/40"
+                      >
+                        {copiedField === 'uptimeUrl' ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                        {copiedField === 'uptimeUrl' ? 'Copied' : 'Copy'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleTestMonitorUrl(networking.uptimeMonitorUrl!)}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/35 bg-emerald-500/15 px-3 py-2 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/25"
+                      >
+                        Test Link
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {uptimeProbeResult && (
+                  <div
+                    className={`font-mono text-[11px] ${
+                      uptimeProbeResult.ok ? 'text-emerald-300' : 'text-amber-300'
+                    }`}
+                  >
+                    {uptimeProbeResult.text}
+                  </div>
+                )}
+              </div>
+
+              {/* In-App Custom Domain Manager */}
+              <div className="rounded-lg border border-red-950/80 bg-[#0a0406] p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-100">
+                    <Globe className="h-3.5 w-3.5 text-red-400" />
+                    <span>Connect Custom Domain</span>
+                  </div>
+                  {networking?.customDomain && (
+                    <span
+                      className={`font-mono text-[11px] font-semibold ${
+                        networking.customDomainVerified ? 'text-emerald-400' : 'text-amber-300'
+                      }`}
+                    >
+                      {networking.customDomainVerified ? 'DNS Verified' : 'Pending DNS Verification'}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <input
+                    type="text"
+                    value={domainInput}
+                    onChange={(e) => setDomainInput(e.target.value)}
+                    placeholder="api.yourdomain.com"
+                    className="flex-1 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
+                  />
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={domainBusy}
+                      onClick={() => void handleDomainSave({ customDomain: domainInput })}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-red-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                    >
+                      {domainBusy ? 'Saving...' : 'Save Domain'}
+                    </button>
+                    {networking?.customDomain && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={verifyBusy}
+                          onClick={() => void handleVerifyDns()}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-2 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
+                        >
+                          {verifyBusy ? 'Checking...' : 'Verify DNS'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={domainBusy}
+                          onClick={() => void handleDomainSave({ customDomain: '' })}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-red-950/90 bg-[#12070a] px-3 py-2 text-xs text-slate-300 hover:text-red-300"
+                        >
+                          Remove
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded border border-red-950/60 bg-[#12070a] p-3 text-[11px] text-slate-400 space-y-1">
+                  <div>
+                    <span className="text-slate-200 font-medium">Custom Domain DNS:</span> Point a{' '}
+                    <code className="font-mono text-rose-300">CNAME</code> record from your custom domain to{' '}
+                    <code className="font-mono text-emerald-300">
+                      {networking?.railwayDomain || networking?.serverHost || 'your-service.up.railway.app'}
+                    </code>
+                    .
+                  </div>
+                  <div>
+                    <span className="text-slate-200 font-medium">Railway Domain Option:</span> You can also enter an extra{' '}
+                    <code className="font-mono text-emerald-300">*.up.railway.app</code> or custom domain added under Railway Service → Settings → Networking so TLS certificates issue automatically.
+                  </div>
+                </div>
+
+                {dnsCheckResult && (
+                  <div
+                    className={`rounded-md border p-2.5 text-xs ${
+                      dnsCheckResult.verified
+                        ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
+                        : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+                    }`}
+                  >
+                    {dnsCheckResult.message}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </section>
       )}
 

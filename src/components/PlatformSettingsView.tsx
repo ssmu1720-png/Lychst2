@@ -6,6 +6,7 @@ import {
   Cloud,
   CloudOff,
   Database,
+  Globe,
   LogOut,
   Mail,
   MessageSquare,
@@ -90,6 +91,12 @@ export function PlatformSettingsView({
   const [lowCoinAlertThreshold, setLowCoinAlertThreshold] = useState<number>(
     preferences.lowCoinAlertThreshold ?? 10
   );
+  const [railwayDomain, setRailwayDomain] = useState<string>(
+    preferences.railwayDomain ?? ''
+  );
+  const [platformWildcardDomain, setPlatformWildcardDomain] = useState<string>(
+    preferences.platformWildcardDomain ?? ''
+  );
 
   const [saving, setSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -116,6 +123,7 @@ export function PlatformSettingsView({
           webhookSecret,
           promoEmailsOptIn,
           lowCoinAlertThreshold,
+          ...(currentUser.isAdmin ? { railwayDomain, platformWildcardDomain } : {}),
         }),
       });
       const data = await resp.json();
@@ -472,6 +480,53 @@ export function PlatformSettingsView({
             </span>
           </label>
         </div>
+
+        {currentUser.isAdmin && (
+          <div className="border-t border-red-950/70 pt-4 space-y-4">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Globe className="h-3.5 w-3.5 text-emerald-400" />
+                  <span className="text-xs font-semibold text-slate-100">
+                    Railway Service Domain (Node Apps &amp; Bots)
+                  </span>
+                </div>
+                <span className="font-mono text-[10px] text-emerald-300">
+                  *.up.railway.app
+                </span>
+              </div>
+              <input
+                type="text"
+                value={railwayDomain}
+                onChange={(e) => setRailwayDomain(e.target.value)}
+                placeholder="lyrihost-production.up.railway.app"
+                className="w-full rounded-md border border-red-950/80 bg-[#080305] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-emerald-400 focus:outline-none"
+              />
+              <p className="text-[11px] text-slate-400">
+                Auto-detected from <code className="font-mono text-emerald-300">RAILWAY_PUBLIC_DOMAIN</code> when deployed on Railway, or enter your <code className="font-mono text-slate-300">.up.railway.app</code> domain here. All Node app links (<code className="font-mono text-rose-300">/app/&lt;slug&gt;/</code>), UptimeRobot URLs, and DNS CNAME instructions use this domain.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Globe className="h-3.5 w-3.5 text-red-400" />
+                <span className="text-xs font-semibold text-slate-100">
+                  Platform Wildcard Domain (Optional · Subdomains)
+                </span>
+              </div>
+              <input
+                type="text"
+                value={platformWildcardDomain}
+                onChange={(e) => setPlatformWildcardDomain(e.target.value)}
+                placeholder="lyrihost.site"
+                className="w-full rounded-md border border-red-950/80 bg-[#080305] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
+              />
+              <p className="text-[11px] text-slate-400">
+                When configured alongside <code className="font-mono text-rose-300">*.yourdomain</code> on Railway, every Node app &amp; bot also gets a <code className="font-mono text-emerald-300">&lt;slug&gt;.yourdomain</code> subdomain in addition to its Railway <code className="font-mono text-slate-300">/app/&lt;slug&gt;/</code> link.
+              </p>
+            </div>
+          </div>
+        )}
 
         <div className="border-t border-red-950/70 pt-4 space-y-2">
           <div className="flex items-center gap-2">

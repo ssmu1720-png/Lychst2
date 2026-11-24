@@ -5,6 +5,7 @@ import {
   Cpu,
   GitBranch,
   Github,
+  Globe,
   Layers,
   Rocket,
   ShieldCheck,
@@ -110,8 +111,14 @@ export function CustomRepoDeployView({
     ],
   });
 
+  const [customDomain, setCustomDomain] = useState('');
   const [deploying, setDeploying] = useState(false);
   const [deployError, setDeployError] = useState<string | null>(null);
+
+  const isNodeRuntime =
+    settings.runtime === 'node-20' ||
+    settings.runtime === 'node-22' ||
+    settings.runtime === 'bun-1';
 
   const handleRepoChange = (val: string) => {
     setRepoInput(val);
@@ -132,7 +139,12 @@ export function CustomRepoDeployView({
     } else if (nextPlatform === 'slack') {
       setFramework('Slack Bot');
     } else {
-      setFramework('Custom Worker');
+      setFramework('Node.js Web App');
+      setSettings((prev) => ({
+        ...prev,
+        runtime:
+          prev.runtime === 'python-3.12' || prev.runtime === 'docker' ? 'node-20' : prev.runtime,
+      }));
     }
   };
 
@@ -166,6 +178,7 @@ export function CustomRepoDeployView({
           framework,
           commitSha: 'head',
           planId: selectedPlan.id,
+          ...(isNodeRuntime && customDomain.trim() ? { customDomain: customDomain.trim() } : {}),
           settings: {
             ...settings,
             name: cleanName,
@@ -366,7 +379,7 @@ export function CustomRepoDeployView({
               <option value="telegram">Telegram</option>
               <option value="discord">Discord</option>
               <option value="slack">Slack</option>
-              <option value="custom">Custom Worker</option>
+              <option value="custom">Node.js Web App / API</option>
             </select>
           </div>
 
@@ -462,6 +475,28 @@ export function CustomRepoDeployView({
             />
           </div>
         </div>
+
+        {/* Optional Custom Domain (Node.js / Bun only) */}
+        {isNodeRuntime && (
+          <div className="border-t border-red-950/70 pt-5 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                <Globe className="h-3.5 w-3.5 text-red-400" />
+                Custom Domain (Optional · Node Apps &amp; Bots)
+              </label>
+              <span className="font-mono text-[11px] text-slate-400">
+                You can also add or change this anytime under Domains
+              </span>
+            </div>
+            <input
+              type="text"
+              value={customDomain}
+              onChange={(e) => setCustomDomain(e.target.value)}
+              placeholder="api.yourdomain.com (leave empty to use server Railway /app/<slug>/ URL)"
+              className="w-full rounded-md border border-red-950/90 bg-[#080305] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-red-400 focus:outline-none"
+            />
+          </div>
+        )}
 
         {/* Environment Variables */}
         <div className="border-t border-red-950/70 pt-5">

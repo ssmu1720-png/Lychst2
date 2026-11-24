@@ -207,10 +207,33 @@ export interface BotDeployment {
   totalChecks?: number;
   uptimePercentage?: number;
   healthScore?: number;
+  appSlug?: string;
+  monitorToken?: string;
+  publicAppEnabled?: boolean;
+  customDomain?: string | null;
+  customDomainVerified?: boolean;
   telemetryHistory: TelemetryPoint[];
   settings: BotSettings;
   scanReport: GitHubScanResult | null;
   logs: LogEntry[];
+}
+
+export interface DeploymentNetworkingInfo {
+  supported: boolean;
+  publicAppEnabled: boolean;
+  appSlug: string;
+  monitorToken: string;
+  internalPort: number;
+  pathAppUrl: string | null;
+  subdomainAppUrl: string | null;
+  customDomain: string | null;
+  customDomainVerified: boolean;
+  customDomainUrl: string | null;
+  uptimeMonitorUrl: string | null;
+  serverHost: string;
+  railwayDomain: string;
+  railwayDomainSource: 'preference' | 'env' | 'detected' | 'none';
+  platformWildcardDomain: string;
 }
 
 export interface PlatformPreferences {
@@ -226,6 +249,8 @@ export interface PlatformPreferences {
   webhookSecret: string;
   promoEmailsOptIn?: boolean;
   lowCoinAlertThreshold?: number;
+  railwayDomain?: string;
+  platformWildcardDomain?: string;
 }
 
 export interface MpesaStkRequest {
